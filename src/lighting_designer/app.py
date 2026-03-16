@@ -26,6 +26,50 @@ from PySide6.QtGui import (
 
 
 # =============================================================================
+#  FIXTURE LIBRARY
+# =============================================================================
+
+FIXTURE_LIBRARY = {
+    "downlight": {
+        "name": "Downlight",
+        "lumens": 800,
+        "watts": 10,
+        "beam": 60,
+    },
+    "spot": {
+        "name": "Spot",
+        "lumens": 600,
+        "watts": 8,
+        "beam": 36,
+    },
+    "panel": {
+        "name": "פאנל לד",
+        "lumens": 3600,
+        "watts": 36,
+        "beam": 120,
+    },
+    "linear": {
+        "name": "גוף תאורה ליניארי",
+        "lumens": 1200,
+        "watts": 12,
+        "beam": 90,
+    },
+    "wallwasher": {
+        "name": "מתקן קיר",
+        "lumens": 900,
+        "watts": 12,
+        "beam": 20,
+    },
+    "strip": {
+        "name": "פס לד",
+        "lumens": 1000,
+        "watts": 10,
+        "beam": 120,
+    },
+}
+
+
+# =============================================================================
 #  DATA MODELS
 # =============================================================================
 
@@ -1116,7 +1160,7 @@ class LightingApp(QMainWindow):
 
         spot_grid.addWidget(make_label("רווח בין ספוטים (מ׳):"), 0, 1)
         self.spot_spacing = make_input(1.5, 0.5, 5.0, 1, "מ׳")
-        strip_grid.addWidget(self.spot_spacing, 0, 0)
+        spot_grid.addWidget(self.spot_spacing, 0, 0)
 
         layout.addWidget(spot_group)
 
