@@ -1,6 +1,6 @@
 [project]
 name = "lighting-designer"
-version = "0.1.1"
+version = "0.1.2"
 description = "Professional lighting design calculator with a full Hebrew interface"
 readme = "README.md"
 requires-python = ">=3.11"
