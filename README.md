@@ -14,7 +14,9 @@ Professional lighting design calculator with a **fully Hebrew** interface. Built
 
 ```bash
 pip install lighting-designer
-ldesign
+ldesign            # console entry point
+# or:
+python -m lighting_designer
 ```
 
 ---
