@@ -188,43 +188,37 @@ class IESPhotometry:
                 break
         return round(crossing * 2, 1) or 36.0
 
-    def plane_profile(self) -> Tuple[List[float], List[float]]:
-        """Return (vertical_angles, candela) averaged across all horizontal planes.
-
-        We treat luminaires as rotationally symmetric for point calculations, so the
-        candela at each vertical angle is the mean over the measured C-planes.
-        """
-        n_v = len(self.vertical_angles)
-        n_h = len(self.horizontal_angles)
-        if n_v == 0 or n_h == 0 or len(self.candela_values) < n_v * n_h:
-            return list(self.vertical_angles), []
-        cd = []
-        for r in range(n_v):
-            row = [self.candela_values[r * n_h + c] for c in range(n_h)]
-            cd.append(sum(row) / n_h * self.multiplier)
-        return list(self.vertical_angles), cd
-
-    def intensity_at(self, theta_deg: float) -> float:
-        """Interpolate luminous intensity (cd) at vertical angle theta (0 = nadir)."""
-        angles, cd = self.plane_profile()
-        if not cd:
+    def intensity_at(self, gamma_deg: float, c_deg: float = 0.0) -> float:
+        """Luminous intensity (cd) at vertical angle ``gamma_deg`` (0=nadir),
+        interpolated from the parsed candela grid. Uses the first available C-plane
+        when ``c_deg`` cannot be matched."""
+        if not self.candela_values or not self.vertical_angles:
             return 0.0
-        t = abs(theta_deg)
-        if t <= angles[0]:
-            return max(0.0, cd[0])
-        if t >= angles[-1]:
-            return max(0.0, cd[-1])
-        for i in range(len(angles) - 1):
-            a0, a1 = angles[i], angles[i + 1]
-            if a0 <= t <= a1:
-                f = (t - a0) / max(a1 - a0, 1e-9)
-                return max(0.0, cd[i] + f * (cd[i + 1] - cd[i]))
-        return max(0.0, cd[-1])
+        n_v = len(self.vertical_angles)
+        n_h = max(len(self.horizontal_angles), 1)
+        # nearest C-plane column
+        if self.horizontal_angles:
+            col = min(range(n_h), key=lambda j: abs(self.horizontal_angles[j] - c_deg))
+        else:
+            col = 0
+        col_vals = [self.candela_values[r * n_h + col] if r * n_h + col < len(self.candela_values) else 0.0 for r in range(n_v)]
+        # linear interpolation over vertical angles
+        if gamma_deg <= self.vertical_angles[0]:
+            base = col_vals[0]
+        elif gamma_deg >= self.vertical_angles[-1]:
+            base = col_vals[-1]
+        else:
+            base = col_vals[-1]
+            for i in range(n_v - 1):
+                a0, a1 = self.vertical_angles[i], self.vertical_angles[i + 1]
+                if a0 <= gamma_deg <= a1:
+                    t = (gamma_deg - a0) / max(a1 - a0, 1e-9)
+                    base = col_vals[i] + t * (col_vals[i + 1] - col_vals[i])
+                    break
+        return base * self.multiplier
 
     def to_fixture_dict(self) -> Dict:
-        angles, cd = self.plane_profile()
-        photometry = {"v": [round(a, 2) for a in angles], "cd": [round(c, 2) for c in cd]} if cd else None
-        d = {
+        return {
             "lm": round(self.luminous_flux_lm, 1),
             "w": round(self.input_watts, 1),
             "cri": 90,
@@ -236,9 +230,6 @@ class IESPhotometry:
             "ies_peak_cd": round(self.peak_cd(), 1),
             "ies_efficacy": round(self.efficacy_lm_per_w(), 1),
         }
-        if photometry:
-            d["photometry"] = photometry
-        return d
 
 
 class IESParser:
@@ -371,13 +362,12 @@ class LDTParser:
                         ph.candela_values.append(float(tok))
                     except ValueError:
                         pass
-        except (IndexError, ValueError) as exc:
-            raise ValueError(f"Invalid EULUMDAT (.ldt) file: {exc}") from exc
-        if ph.luminous_flux_lm <= 0 and not ph.candela_values:
-            raise ValueError("Invalid EULUMDAT (.ldt) file: zero luminous flux and no candela data")
-        if ph.luminous_flux_lm <= 0 and ph.candela_values:
-            ph.luminous_flux_lm = IESParser._integrate_flux(
-                ph.candela_values, ph.vertical_angles, ph.horizontal_angles)
+        except Exception as exc:
+            raise ValueError(f"Failed to parse EULUMDAT file {os.path.basename(path)}: {exc}") from exc
+        if not ph.luminous_flux_lm or ph.luminous_flux_lm <= 0:
+            raise ValueError(
+                f"EULUMDAT file {os.path.basename(path)} has zero/invalid luminous flux"
+            )
         return ph
 
 
@@ -396,31 +386,14 @@ class ProjectContainer:
 
     @staticmethod
     def save(room_dict: Dict, path: str, asset_paths: Optional[List[str]] = None) -> None:
-        # Work on a shallow copy so we can rewrite asset references to portable,
-        # relative "assets/<basename>" paths without mutating the live model dict.
-        room_dict = json.loads(json.dumps(room_dict, ensure_ascii=False))
-        bundled: Dict[str, str] = {}
-        if asset_paths:
-            for ap in asset_paths:
-                if ap and os.path.isfile(ap):
-                    bundled[os.path.basename(ap)] = ap
-
-        def _rel_if_bundled(value: str) -> str:
-            base = os.path.basename(value) if value else ""
-            return f"assets/{base}" if base in bundled else value
-
-        fp = room_dict.get("floor_plan")
-        if isinstance(fp, dict) and fp.get("path"):
-            fp["path"] = _rel_if_bundled(fp["path"])
-        br = room_dict.get("branding")
-        if isinstance(br, dict) and br.get("company_logo"):
-            br["company_logo"] = _rel_if_bundled(br["company_logo"])
-
         with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("version.txt", ProjectContainer.FORMAT_VERSION)
             zf.writestr("project.json", json.dumps(room_dict, ensure_ascii=False, indent=2))
-            for base, ap in bundled.items():
-                zf.write(ap, "assets/" + base)
+            if asset_paths:
+                for ap in asset_paths:
+                    if ap and os.path.isfile(ap):
+                        arcname = "assets/" + os.path.basename(ap)
+                        zf.write(ap, arcname)
 
     @staticmethod
     def load(path: str) -> Tuple[Dict, Dict[str, bytes]]:
@@ -672,7 +645,7 @@ class ProfessionalPDFExporter:
         kpi_row = [[traffic("Lux", f"{avg:.0f} / {tgt}", "#2ECC7A" if lux_ok else "#F0A030"),
                     traffic("Uniformity", f"{uniformity:.2f}", "#2ECC7A" if uni_ok else "#EF4444"),
                     traffic("Watts", f"{watts:.0f} W", "#3D8EF0"),
-                    traffic("UGR", str(ugr), "#2ECC7A" if ugr and int(str(ugr).split()[0]) < 22 else "#F0A030")]]
+                    traffic("UGR", str(ugr), "#2ECC7A" if ugr and float(str(ugr).split()[0]) <= UGR_LIMITS.get(self.room.room_type, 22) else "#F0A030")]]
         kpi_tbl = Table(kpi_row, colWidths=[40*mm]*4)
         kpi_tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#202638")),
@@ -972,36 +945,30 @@ class AIDesignReviewer:
         uniformity = (snap.min_lux / avg) if (snap and avg > 0) else 0
         layers = [l.name for l in room.layers if l.enabled] if room.layers else []
         brief = room.client_brief
-        mf = room.maintenance_factor
-        # Reported averages are maintained (end-of-life) values; initial (new) is
-        # the maintained value divided by the maintenance factor.
-        initial_avg = avg / mf if mf else avg
+        mf = getattr(room, "maintenance_factor", 0.8)
         u0_target = uniformity_target(room.room_type)
-        ambient_zone = LUX_AMBIENT_ZONES.get(room.room_type)
-        ambient_txt = f" | אזור היקפי/סובב: {ambient_zone} lx" if ambient_zone else ""
-        non_wp = " (מגורים — EN 12464-1 הוא תקן מקומות עבודה ואינו חל ישירות)" \
-            if room.room_type in NON_WORKPLACE_ROOM_TYPES else ""
+        ambient_target = LUX_AMBIENT_ZONES.get(room.room_type, max(int(tgt * 0.6), 50))
+        initial_avg = avg / max(mf, 0.01) if avg else 0
         return f"""אתה מתכנן תאורה מקצועי בכיר. קבל את הנתונים הבאים וכתוב סקירת עיצוב קצרה ומקצועית (עד 8 נקודות) בעברית.
 
 פרויקט: {room.project_name}
-סוג חדר: {room.room_type}{non_wp} | {room.width:.1f}×{room.length:.1f}m | תקרה {room.ceiling_height:.2f}m
-החזרי משטחים: תקרה {room.reflectance_ceiling:.2f} / קירות {room.reflectance_walls:.2f} / רצפה {room.reflectance_floor:.2f}
-CCT: {room.cct_kelvin}K | CRI: {cri:.0f} | UGR: {ugr} (גבול {UGR_LIMITS.get(room.room_type, 22)})
-יעד לוקס (משימה): {tgt} lx{ambient_txt}
-לוקס מתוחזק (סוף-חיים): {avg:.0f} | לוקס התחלתי (חדש): {initial_avg:.0f} | מקדם תחזוקה MF: {mf:.2f}
-אחידות U0 בפועל: {uniformity:.2f} (יעד {u0_target:.2f})
+סוג חדר: {room.room_type} | {room.width:.1f}×{room.length:.1f}m | תקרה {room.ceiling_height:.2f}m
+CCT: {room.cct_kelvin}K | CRI: {cri:.0f} | UGR: {ugr} (מקסימום מותר {UGR_LIMITS.get(room.room_type, 22)})
+יעד לוקס (אזור משימה): {tgt} | יעד אזור היקפי/אמביינט: {ambient_target}
+תאורה נשמרת (maintained) ממוצעת: {avg:.0f} lx | תאורה התחלתית (initial) משוערת: {initial_avg:.0f} lx | מקדם תחזוקה MF={mf:.2f}
+אחידות U0 בפועל: {uniformity:.2f} (יעד ≥ {u0_target:.2f})
 הספק: {watts:.0f}W | LPD: {watts/max(room.area, 0.01):.1f} W/m²
 שכבות פעילות: {', '.join(layers) or 'אין'}
 תחושה רצויה: {brief.desired_feeling}
 סצינות נדרשות: {brief.wanted_scenes}
 
 כתוב סקירה מקצועית עם:
-1. הערכת ביצועים (לוקס מתוחזק מול התחלתי, אחידות מול יעד, CRI, UGR מול הגבול)
-2. המלצות לשיפור (כולל מקדם תחזוקה ולוח זמני תחזוקה)
-3. הצעות לשכבות ומערכות (משימה מול תאורה היקפית/סובבת)
-4. הערות לאינטגרציה עם אור יום ובקרה
+1. הערכת ביצועים (לוקס נשמר מול התחלתי, אחידות, CRI, UGR)
+2. המלצות לשיפור (כולל הפרדת אזור משימה מאזור היקפי)
+3. הצעות לשכבות ומערכות
+4. הערות לאינטגרציה עם אור יום
 5. שיקולי חיסכון באנרגיה
-בסוף הוסף הסתייגות קצרה: ערכי הלוקס מבוססים על מודל ישיר+עקיף מפושט (split-flux) והערכת UGR מפושטת לפי CIE 117; יש לאמת בתוכנת תכנה פוטומטרית מלאה (למשל DIALux/Relux) לפני ביצוע.
+הסתייגות: זוהי הערכה תכנונית ראשונית המבוססת על מודל מפושט ואינה מחליפה חישוב פוטומטרי מלא (IES/ray-trace) או בדיקת תקן רשמית.
 הגב בעברית בנקודות, בצורה מקצועית וממוקדת."""
 
     @classmethod
@@ -1082,9 +1049,8 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFrame, QGroupBox,
 # COLOUR PALETTE (matches main app)
 # ─────────────────────────────────────────────────────────────────────────────
 P = {
-    "bg":      "#0F1117", "surface": "#171A22", "card":   "#1E2230",
-    "card2":  "#252A3A", "panel2":  "#202638", "panel3": "#141A28",
-    "input":   "#1A1E2A",
+    "bg":      "#0F1117", "surface": "#171A22", "card":   "#1E2230", "card2":  "#252A3A",
+    "panel2":  "#202638", "panel3": "#141A28", "input":  "#1A1E2A",
     "border":  "#2A3048", "border2":"#3A4468", "text":   "#F0F4FF",
     "muted":   "#8A93A8", "blue":   "#3D8EF0", "green":  "#2ECC7A",
     "amber":   "#F0A030", "red":    "#EF4444", "purple": "#9F7AEA",
@@ -3131,12 +3097,6 @@ class SnapshotsPanel(QWidget):
 
     def set_room_provider(self, fn): self._room_fn = fn
 
-    def get_snaps(self): return list(self._snaps)
-
-    def set_snaps(self, snaps):
-        self._snaps = [dict(s) for s in (snaps or [])]
-        self._rebuild()
-
     def _save_prompt(self):
         from PySide6.QtWidgets import QInputDialog
         name, ok = QInputDialog.getText(
@@ -3148,6 +3108,12 @@ class SnapshotsPanel(QWidget):
         ts = dt.datetime.now().strftime("%H:%M  %d/%m")
         self._snaps.insert(0, {"name":name,"ts":ts,"room":room_dict})
         if len(self._snaps) > 20: self._snaps = self._snaps[:20]
+        self._rebuild()
+
+    def get_snapshots(self): return list(self._snaps)
+
+    def set_snapshots(self, snaps):
+        self._snaps = [dict(s) for s in (snaps or [])][:20]
         self._rebuild()
 
     def _rebuild(self):
@@ -3199,7 +3165,7 @@ class ClientHTMLExporter:
 
         def status_class(ok): return "ok" if ok else "warn"
         lux_ok  = status_class(0.9 <= avg/max(tgt,1) <= 1.4)
-        uni_ok  = status_class(uni >= uniformity_target(getattr(room, "room_type", "")))
+        uni_ok  = status_class(uni >= 0.35)
         cri_ok  = status_class(cri >= 90)
 
         html = f"""<!DOCTYPE html>
@@ -3993,9 +3959,10 @@ class KPIStrip(QWidget):
         self.lux.set_value(
             f"{avg:.0f}",
             "ok" if 0.9 <= ratio <= 1.4 else "warn" if ratio > 0.5 else "bad")
+        _u0t = uniformity_target(getattr(room, "room_type", ""))
         self.uni.set_value(
             f"{uni:.2f}",
-            "ok" if uni >= 0.4 else "warn" if uni >= 0.25 else "bad")
+            "ok" if uni >= _u0t else "warn" if uni >= _u0t * 0.65 else "bad")
         self.cri.set_value(
             f"{cri:.0f}",
             "ok" if cri >= 90 else "warn" if cri >= 80 else "bad")
@@ -4172,6 +4139,53 @@ def draw_dimension_overlay(painter: QPainter, renderer) -> None:
 # BUG FIXES  (QA + developer)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def patch_lightingapp_bugs(cls) -> None:
+    """
+    Monkey-patch LightingApp to fix bugs found in review.
+    Called once after class definition in main module.
+    """
+    original_init_body = cls.__init__
+
+    def safe_init(self):
+        original_init_body(self)
+        # Fix 1: _view_mode not initialised
+        if not hasattr(self, "_view_mode"):
+            self._view_mode = "designer"
+        # Fix 2: _recalc_timer pre-create
+        if not hasattr(self, "_recalc_timer"):
+            self._recalc_timer = QTimer(self)
+            self._recalc_timer.setSingleShot(True)
+            self._recalc_timer.timeout.connect(self.recalculate)
+
+    cls.__init__ = safe_init
+
+    # Fix 3: safe branding access in export
+    original_export = cls.export_client_html if hasattr(cls, "export_client_html") else None
+    if original_export:
+        def safe_export(self):
+            if not hasattr(self.room, "branding") or self.room.branding is None:
+                QMessageBox.warning(self, "ייצוא", "אנא הזן שם חברה בטאב Project לפני הייצוא.")
+                return
+            original_export(self)
+        cls.export_client_html = safe_export
+
+    # Fix 4: _on_view_changed safe
+    def safe_view_changed(self, mode: str):
+        self._view_mode = mode
+        if mode == "client":
+            self.status.showMessage("👤 מצב לקוח — תצוגה נקייה")
+            if hasattr(self, "results") and self.results is not None:
+                self.results.hide()
+        else:
+            self.status.showMessage("🛠 מצב מעצב")
+            if hasattr(self, "results") and self.results is not None:
+                self.results.show()
+    cls._on_view_changed = safe_view_changed
+
+    # Fix 5: duplicate _last_snapshot — ensure single definition
+    # (already fixed structurally, this is a runtime guard)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # ONBOARDING OVERLAY  (PM + designer)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4289,6 +4303,7 @@ __all__ = [
     "LEFT_TABS", "RESULT_TABS",
     "CCTVisualSelector",
     "draw_dimension_overlay",
+    "patch_lightingapp_bugs",
     "OnboardingOverlay",
 ]
 
@@ -4297,7 +4312,7 @@ _V8_PATCH_LOADED    = True
 _V8_CONTROLS_LOADED = True
 _V8_UX_LOADED       = True
 _V8_TEAM_LOADED     = True
-HEET = f"""
+STYLESHEET = f"""
 QMainWindow, QWidget {{
     background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #0B0F18, stop:0.55 #111724, stop:1 #070A10);
     color: {P['text']};
@@ -4371,39 +4386,81 @@ QToolBar {{
 }}
 """
 
-# Maintained illuminance targets (lux), aligned with EN 12464-1:2021 task values
-# where a workplace task exists. Residential spaces (סלון, חדר שינה) are NOT covered
-# by EN 12464-1 — those are sensible design targets, flagged in the UI.
+# Maintained illuminance targets (lux).
+# Workplace values follow EN 12464-1:2021 task-area requirements:
+#   משרד/חדר עבודה (writing/typing/reading) = 500 lx
+#   מטבח (commercial kitchen task) = 500 lx; general ambient ~300 lx (see LUX_AMBIENT_ZONES)
+#   ספריה (reading area) = 500 lx
+#   חנות (retail sales area) = 300 lx
+#   חדר אמבטיה / מסדרון (circulation/sanitary) per EN 12464-1 ~200 / 100 lx
+# NOTE: residential types (סלון / חדר שינה) are NOT EN 12464-1 workplace values —
+# EN 12464-1 covers indoor *work* places only. These are sensible dwelling defaults
+# (see NON_WORKPLACE_ROOM_TYPES) and are intentionally lower than task standards.
 LUX_STANDARDS = {
-    "סלון": 150,          # residential ambient (not an EN 12464 task value)
-    "מטבח": 500,          # EN 12464 food prep task; ambient dining zone ~300
-    "חדר שינה": 120,      # residential ambient (not an EN 12464 task value)
-    "משרד": 500,          # EN 12464 writing/typing/reading
-    "חדר עבודה": 500,     # EN 12464 technical drawing/office task
-    "מסדרון": 100,        # EN 12464 circulation area
-    "חדר אמבטיה": 200,    # EN 12464 bathrooms/washrooms
-    "חנות": 300,          # EN 12464 retail sales area
-    "מסעדה": 200,         # restaurant ambient
-    "ספריה": 500,         # EN 12464 reading area
+    "סלון": 150,
+    "מטבח": 500,
+    "חדר שינה": 120,
+    "משרד": 500,
+    "חדר עבודה": 500,
+    "מסדרון": 100,
+    "חדר אמבטיה": 200,
+    "חנות": 300,
+    "מסעדה": 200,
+    "ספריה": 500,
 }
-# Secondary/ambient illuminance for spaces that have a brighter task sub-zone.
-LUX_AMBIENT_ZONES = {"מטבח": 300}
-CRI_STANDARDS = {**{k: 80 for k in LUX_STANDARDS}, "מטבח": 90, "חדר אמבטיה": 90, "חנות": 90, "מסעדה": 90}
-# EN 12464-1 UGR limits: offices/reading 19, kitchens/retail 22, circulation/bath 25.
-UGR_LIMITS = {**{k: 22 for k in LUX_STANDARDS}, "משרד": 19, "חדר עבודה": 19, "ספריה": 19,
-              "מסדרון": 25, "חדר אמבטיה": 25, "חדר שינה": 22}
-# EN 12464-1 minimum uniformity (U0 = Emin/Eavg): 0.60 for task areas,
-# 0.40 for circulation/immediate-surrounding areas.
+
+# Residential / non-workplace room types: EN 12464-1 does not define maintained
+# illuminance for these; the LUX_STANDARDS values are dwelling design defaults.
+NON_WORKPLACE_ROOM_TYPES = {"סלון", "חדר שינה", "מסדרון", "חדר אמבטיה", "מסעדה"}
+
+# General ambient (surrounding) illuminance per zone, distinct from the task area.
+# Used to express that e.g. a kitchen task plane needs 500 lx while general kitchen
+# ambient lighting is ~300 lx (EN 12464-1 task / immediate-surrounding grading).
+LUX_AMBIENT_ZONES = {
+    "מטבח": 300,
+    "משרד": 300,
+    "חדר עבודה": 300,
+    "ספריה": 300,
+    "חנות": 200,
+    "מסעדה": 150,
+    "סלון": 100,
+    "חדר שינה": 80,
+    "מסדרון": 100,
+    "חדר אמבטיה": 150,
+}
+CRI_STANDARDS = {**{k: 80 for k in LUX_STANDARDS}, "מטבח": 90, "חדר אמבטיה": 90, "חנות": 95, "מסעדה": 90}
+# Unified Glare Rating limits (EN 12464-1:2021). Lower = stricter.
+# Offices / reading 19; circulation & sanitary 25; bedroom 22 (residential default).
+UGR_LIMITS = {
+    **{k: 22 for k in LUX_STANDARDS},
+    "משרד": 19,
+    "חדר עבודה": 19,
+    "ספריה": 19,
+    "מסדרון": 25,
+    "חדר אמבטיה": 25,
+    "חדר שינה": 22,
+}
+
+# Wall/floor uniformity (U0 = E_min / E_avg) targets per activity type.
+# EN 12464-1 task areas require U0 >= 0.60; circulation/transition areas 0.40.
 UNIFORMITY_TARGETS = {
-    "משרד": 0.60, "חדר עבודה": 0.60, "מטבח": 0.60, "ספריה": 0.60, "חנות": 0.60,
-    "מסדרון": 0.40, "סלון": 0.40, "חדר שינה": 0.40, "חדר אמבטיה": 0.40, "מסעדה": 0.40,
+    "משרד": 0.60,
+    "חדר עבודה": 0.60,
+    "מטבח": 0.60,
+    "ספריה": 0.60,
+    "חנות": 0.60,
+    "מסעדה": 0.40,
+    "סלון": 0.40,
+    "חדר שינה": 0.40,
+    "מסדרון": 0.40,
+    "חדר אמבטיה": 0.40,
 }
-# Residential room types where EN 12464-1 (a workplace standard) does not strictly apply.
-NON_WORKPLACE_ROOM_TYPES = {"סלון", "חדר שינה"}
+TASK_ROOM_TYPES = {"משרד", "חדר עבודה", "מטבח", "ספריה", "חנות"}
 
 
 def uniformity_target(room_type: str) -> float:
-    return UNIFORMITY_TARGETS.get(room_type, 0.60)
+    """Minimum acceptable U0 (E_min/E_avg) for the given room type."""
+    return UNIFORMITY_TARGETS.get(room_type, 0.40)
 LPD_LIMITS_W_M2 = {
     "סלון": 10,
     "מטבח": 14,
@@ -4418,6 +4475,10 @@ LPD_LIMITS_W_M2 = {
 }
 ROOM_TYPES = list(LUX_STANDARDS)
 BEAM_ANGLES = [15, 24, 36, 45, 60, 90]
+# NOTE: the second tuple element used to be an illuminance multiplier applied to
+# the lux target. Per EN 12464-1 the maintained illuminance target is independent
+# of colour temperature, so the multiplier is fixed at 1.0 for every preset and is
+# no longer used in the lux-target calculation (kept only for backward compat).
 CCT_PRESETS = {
     "חמים (2700K)": (2700, 1.00),
     "נייטרל (3000K)": (3000, 1.00),
@@ -4426,131 +4487,104 @@ CCT_PRESETS = {
 }
 
 
-def cct_preset_for_kelvin(kelvin: int) -> str:
-    """Return the CCT_PRESETS key whose colour temperature is closest to ``kelvin``."""
+def cct_preset_for_kelvin(kelvin: float) -> str:
+    """Return the CCT preset key whose Kelvin value is nearest to ``kelvin``."""
     try:
-        k = int(kelvin)
+        target = float(kelvin)
     except (TypeError, ValueError):
         return "נייטרל (3000K)"
-    return min(CCT_PRESETS.items(), key=lambda kv: abs(kv[1][0] - k))[0]
-
-# Normalized commercial fixture schema. Backward-compatible keys (lm, w, cri, beam,
-# cct, brand, price, track_widths) are always present so LuxEngine / PricingEngine
-# keep working; extra fields describe the product for spec sheets and BOQs.
-FIXTURE_CATEGORIES = [
-    "downlight", "gimbal", "linear", "magnetic", "wall_washer",
-    "track", "exterior", "pendant", "strip", "cove",
-]
-
-
-def _fx(lm, w, cri, beam, cct, price, brand, category, *, sku="", mounting="recessed",
-        ip="IP20", dimming="DALI/0-10V", cct_options=None, cct_default=None,
-        beam_variants=None, length_m=None, lm_per_m=None, photometry_file="",
-        ugr_rated=None, sdcm=3, lifetime=50000, track_widths=None) -> Dict:
-    d = {
-        # legacy / engine keys
-        "lm": lm, "w": w, "cri": cri, "beam": beam, "cct": cct,
-        "brand": brand, "price": price,
-        # normalized schema
-        "category": category, "sku": sku, "mounting": mounting, "ip": ip,
-        "dimming": dimming, "cct_default": cct_default or cct,
-        "cct_options": cct_options or [cct], "sdcm": sdcm, "lifetime": lifetime,
-        "currency": "ILS", "efficacy": round(lm / max(w, 0.1), 1),
-    }
-    if beam_variants:
-        d["beam_variants"] = beam_variants
-    if length_m is not None:
-        d["length_m"] = length_m
-    if lm_per_m is not None:
-        d["lm_per_m"] = lm_per_m
-    if photometry_file:
-        d["photometry_file"] = photometry_file
-    if ugr_rated is not None:
-        d["ugr_rated"] = ugr_rated
-    if track_widths:
-        d["track_widths"] = track_widths
-    return d
-
-
-DEFAULT_FIXTURES: Dict[str, Dict] = {
-    # ── Recessed downlights / gimbals ──────────────────────────────────────
-    "ספוט שקוע 36deg": _fx(850, 9, 90, 36, 3000, 95, "Generic", "downlight",
-                            sku="DL-836-90", beam_variants=[24, 36, 60], ugr_rated=19),
-    "ספוט מתכוונן 24deg": _fx(820, 9, 90, 24, 3000, 125, "Generic", "gimbal",
-                              sku="GM-924-90", mounting="recessed-adjustable",
-                              beam_variants=[15, 24, 36], ugr_rated=19),
-    "דאונלайт CRI95 שקוע": _fx(1050, 13, 95, 60, 3000, 165, "Premium", "downlight",
-                               sku="DL-1360-95", cct_options=[2700, 3000, 4000],
-                               ugr_rated=19, sdcm=2),
-    "גימבל CRI97 מוזיאון": _fx(680, 9, 97, 15, 3000, 240, "Museum", "gimbal",
-                               sku="GM-915-97", mounting="recessed-adjustable",
-                               beam_variants=[10, 15, 24], sdcm=2, ugr_rated=16),
-    # ── Linear recessed / surface ──────────────────────────────────────────
-    "פס ליניארי שקוע 1.2m": _fx(2640, 24, 90, 110, 3000, 320, "Generic", "linear",
-                                sku="LN-R120", mounting="recessed", length_m=1.2,
-                                lm_per_m=2200, ugr_rated=19),
-    "פס ליניארי צמוד 1.5m": _fx(3450, 30, 90, 110, 4000, 380, "Generic", "linear",
-                                sku="LN-S150", mounting="surface", length_m=1.5,
-                                lm_per_m=2300, cct_options=[3000, 4000]),
-    # ── Magnetic 48V modules (0.8 / 1.3 / 2.5 widths) ──────────────────────
-    "Magnetic 0.8 Slim Linear 30": _fx(450, 6, 90, 110, 3000, 145, "Magnetic Mini",
-                                       "magnetic", sku="MG08-L30", mounting="magnetic",
-                                       length_m=0.3, lm_per_m=1500, track_widths=[0.8]),
-    "Magnetic 1.3 Micro Spot": _fx(560, 7, 90, 36, 3000, 165, "Magnetic Micro",
-                                   "magnetic", sku="MG13-S36", mounting="magnetic",
-                                   beam_variants=[24, 36], track_widths=[1.3]),
-    "Magnetic 1.3 Linear 60": _fx(980, 10, 90, 110, 3000, 235, "Magnetic Micro",
-                                  "magnetic", sku="MG13-L60", mounting="magnetic",
-                                  length_m=0.6, lm_per_m=1630, track_widths=[1.3]),
-    "Magnetic 2.5 Linear 60": _fx(1300, 12, 90, 110, 3000, 260, "Magnetic 48V",
-                                  "magnetic", sku="MG25-L60", mounting="magnetic",
-                                  length_m=0.6, lm_per_m=2170, track_widths=[2.5]),
-    "Magnetic 2.5 Adjustable Spot": _fx(1000, 11, 92, 24, 3000, 190, "Magnetic 48V",
-                                        "magnetic", sku="MG25-S24", mounting="magnetic",
-                                        beam_variants=[15, 24, 36], track_widths=[2.5]),
-    "Magnetic 2.5 Pendant Module": _fx(1250, 13, 90, 80, 3000, 320, "Magnetic 48V",
-                                       "magnetic", sku="MG25-P", mounting="magnetic-pendant",
-                                       track_widths=[2.5]),
-    # ── Wall washers ───────────────────────────────────────────────────────
-    "Wall Washer 48V לינארי": _fx(1500, 14, 90, 60, 3000, 310, "Gaash style",
-                                  "wall_washer", sku="WW-48-60", mounting="magnetic",
-                                  beam_variants=[30, 60], track_widths=[2.5]),
-    "Wall Washer שקוע אסימטרי": _fx(1900, 19, 90, 70, 3000, 360, "Generic",
-                                    "wall_washer", sku="WW-RA-70", mounting="recessed"),
-    # ── Classic track ──────────────────────────────────────────────────────
-    "ספוט מסלול 24deg": _fx(1100, 11, 92, 24, 3000, 155, "TrackCo", "track",
-                            sku="TR-S24", mounting="track-230V",
-                            beam_variants=[15, 24, 38]),
-    "ספוט מסלול CRI95 38deg": _fx(1250, 14, 95, 38, 3000, 210, "TrackCo", "track",
-                                  sku="TR-S38-95", mounting="track-230V", sdcm=2),
-    # ── Exterior IP65 ──────────────────────────────────────────────────────
-    "חוץ IP65 שקוע קרקע": _fx(620, 8, 80, 30, 3000, 175, "ExteriorCo", "exterior",
-                              sku="EX-G30", mounting="inground", ip="IP67"),
-    "חוץ IP65 מבריק קיר": _fx(1100, 12, 80, 60, 4000, 230, "ExteriorCo", "exterior",
-                              sku="EX-W60", mounting="surface", ip="IP65",
-                              cct_options=[3000, 4000]),
-    # ── Pendants / chandelier ──────────────────────────────────────────────
-    "תלוי פנדנט": _fx(1600, 16, 90, 90, 3000, 280, "PendantCo", "pendant",
-                      sku="PD-90", mounting="pendant"),
-    "נברשת דקורטיבית": _fx(4500, 45, 90, 120, 2700, 980, "PendantCo", "pendant",
-                           sku="PD-CH", mounting="pendant"),
-    "פנדנט אקוסטי": _fx(2300, 22, 90, 100, 3000, 520, "Acoustic", "pendant",
-                        sku="PD-AC", mounting="pendant"),
-    # ── LED strip / profile (lm per metre) ─────────────────────────────────
-    "LED Strip 2700K 14.4W/m": _fx(1300, 14, 90, 120, 2700, 90, "StripCo", "strip",
-                                   sku="ST-2700", mounting="profile", length_m=1.0,
-                                   lm_per_m=1300, cct_options=[2700, 3000]),
-    "LED Strip 3000K 19W/m": _fx(1900, 19, 95, 120, 3000, 130, "StripCo", "strip",
-                                 sku="ST-3000-95", mounting="profile", length_m=1.0,
-                                 lm_per_m=1900, sdcm=2),
-    # ── Cove / indirect ────────────────────────────────────────────────────
-    "Cove אינדירקט 3000K": _fx(900, 10, 90, 120, 3000, 110, "Generic", "cove",
-                               sku="CV-3000", mounting="cove", length_m=1.0,
-                               lm_per_m=900),
-}
+    return min(CCT_PRESETS.items(), key=lambda kv: abs(kv[1][0] - target))[0]
 
 PENDANT_TYPES = ["פנדנט בודד", "שורת פנדנטים", "נברשת", "פנדנט אקוסטי"]
+
+
+def fixture_efficacy(d: Dict) -> float:
+    """Derived luminous efficacy (lm/W) for a fixture catalogue entry."""
+    lm = float(d.get("lm", 0) or 0)
+    w = float(d.get("w", 0) or 0)
+    return round(lm / w, 1) if w > 0 else 0.0
+
+
+def normalize_fixture(d: Dict) -> Dict:
+    """Return a fixture dict augmented with the normalized commercial schema.
+
+    Backward compatible: never removes the legacy keys (lm/w/cri/beam/cct/price/
+    brand/track_widths). Adds sensible defaults for the optional commercial fields
+    and a derived ``efficacy`` so LuxEngine/PricingEngine keep working unchanged.
+    """
+    out = dict(d)
+    out.setdefault("currency", "ILS")
+    # default colour-temperature options around the rated CCT
+    if "cct_default" not in out:
+        out["cct_default"] = int(out.get("cct", 3000))
+    out.setdefault("cct_options", sorted({2700, 3000, 4000, int(out.get("cct", 3000))}))
+    out["efficacy"] = fixture_efficacy(out)
+    return out
+
+
+# Commercial-grade fixture catalogue. Efficacies follow realistic per-category
+# ranges (micro/magnetic 70–88 lm/W, downlights 80–95, premium CRI≥95 ~75–90,
+# linear up to ~110, exterior/IP65 lower). Linear/strip entries also expose
+# length_m + lm_per_m. Prices are list prices in ILS (₪).
+_RAW_FIXTURES: Dict[str, Dict] = {
+    # ── Recessed downlights / gimbals ────────────────────────────────────
+    "ספוט שקוע 36deg": {"lm": 720, "w": 8, "cri": 90, "beam": 36, "cct": 3000, "brand": "Generic", "price": 95, "category": "ספוט שקוע", "sku": "DL-08-36", "mounting": "recessed", "ip": "IP20", "dimming": "DALI", "ugr_rated": 19, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "ספוט שקוע 24deg": {"lm": 780, "w": 9, "cri": 90, "beam": 24, "cct": 3000, "brand": "Generic", "price": 105, "category": "ספוט שקוע", "sku": "DL-09-24", "mounting": "recessed", "ip": "IP20", "dimming": "DALI", "ugr_rated": 19, "sdcm": 3, "lifetime_l70_hours": 50000, "beam_variants": [15, 24, 36]},
+    "ספוט שקוע גימבל 36deg": {"lm": 760, "w": 9, "cri": 92, "beam": 36, "cct": 3000, "brand": "Generic", "price": 135, "category": "ספוט מתכוונן", "sku": "GM-09-36", "mounting": "recessed-gimbal", "ip": "IP20", "dimming": "DALI", "ugr_rated": 19, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "ספוט שקוע פרימיום CRI97 24deg": {"lm": 800, "w": 10, "cri": 97, "beam": 24, "cct": 3000, "brand": "Premium", "price": 210, "category": "ספוט שקוע", "sku": "DL-10-97", "mounting": "recessed", "ip": "IP44", "dimming": "Phase/DALI", "ugr_rated": 16, "sdcm": 2, "lifetime_l70_hours": 60000},
+    "ספוט מתכוונן 24deg": {"lm": 790, "w": 9, "cri": 90, "beam": 24, "cct": 3000, "brand": "Generic", "price": 125, "category": "ספוט מתכוונן", "sku": "AJ-09-24", "mounting": "recessed-adjustable", "ip": "IP20", "dimming": "DALI", "ugr_rated": 19, "sdcm": 3, "lifetime_l70_hours": 50000},
+    # ── Linear recessed / surface ────────────────────────────────────────
+    "פס ליניארי שקוע 1.2מ'": {"lm": 1320, "w": 14, "cri": 90, "beam": 110, "cct": 3000, "brand": "Generic", "price": 320, "category": "פס ליניארי", "sku": "LIN-R-120", "mounting": "recessed-linear", "ip": "IP20", "dimming": "DALI", "ugr_rated": 19, "length_m": 1.2, "lm_per_m": 1100, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "פס ליניארי צמוד 1.2מ'": {"lm": 1380, "w": 14, "cri": 90, "beam": 110, "cct": 4000, "brand": "Generic", "price": 295, "category": "פס ליניארי", "sku": "LIN-S-120", "mounting": "surface-linear", "ip": "IP20", "dimming": "DALI", "ugr_rated": 19, "length_m": 1.2, "lm_per_m": 1150, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "פס ליניארי 90cm": {"lm": 990, "w": 11, "cri": 90, "beam": 120, "cct": 3000, "brand": "Generic", "price": 220, "category": "פס ליניארי", "sku": "LIN-090", "mounting": "surface-linear", "ip": "IP20", "dimming": "DALI", "ugr_rated": 19, "length_m": 0.9, "lm_per_m": 1100, "sdcm": 3, "lifetime_l70_hours": 50000},
+    # ── Magnetic 48V modules (0.8 / 1.3 / 2.5) ───────────────────────────
+    "מגנטי 0.8 ליניארי דק 30": {"lm": 360, "w": 5, "cri": 90, "beam": 110, "cct": 3000, "brand": "Magnetic Mini", "price": 145, "category": "מגנטי 48V", "sku": "MAG08-L30", "mounting": "magnetic-48v", "ip": "IP20", "dimming": "DALI", "track_widths": [0.8], "length_m": 0.3, "lm_per_m": 1200, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "מגנטי 1.3 מיקרו ספוט": {"lm": 440, "w": 6, "cri": 90, "beam": 36, "cct": 3000, "brand": "Magnetic Micro", "price": 165, "category": "מגנטי 48V", "sku": "MAG13-SP", "mounting": "magnetic-48v", "ip": "IP20", "dimming": "DALI", "track_widths": [1.3], "ugr_rated": 19, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "מגנטי 1.3 ליניארי 60": {"lm": 840, "w": 10, "cri": 90, "beam": 110, "cct": 3000, "brand": "Magnetic Micro", "price": 235, "category": "מגנטי 48V", "sku": "MAG13-L60", "mounting": "magnetic-48v", "ip": "IP20", "dimming": "DALI", "track_widths": [1.3], "length_m": 0.6, "lm_per_m": 1400, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "מגנטי 2.5 ליניארי 60": {"lm": 1080, "w": 12, "cri": 90, "beam": 110, "cct": 3000, "brand": "Magnetic 48V", "price": 260, "category": "מגנטי 48V", "sku": "MAG25-L60", "mounting": "magnetic-48v", "ip": "IP20", "dimming": "DALI", "track_widths": [2.5], "length_m": 0.6, "lm_per_m": 1800, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "מגנטי 2.5 ספוט מתכוונן": {"lm": 880, "w": 10, "cri": 92, "beam": 24, "cct": 3000, "brand": "Magnetic 48V", "price": 190, "category": "מגנטי 48V", "sku": "MAG25-SP", "mounting": "magnetic-48v", "ip": "IP20", "dimming": "DALI", "track_widths": [2.5], "ugr_rated": 19, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "מגנטי 2.5 מודול פנדנט": {"lm": 1050, "w": 12, "cri": 90, "beam": 80, "cct": 3000, "brand": "Magnetic 48V", "price": 320, "category": "מגנטי 48V", "sku": "MAG25-PD", "mounting": "magnetic-48v", "ip": "IP20", "dimming": "DALI", "track_widths": [2.5], "sdcm": 3, "lifetime_l70_hours": 50000},
+    # ── Wall washers ─────────────────────────────────────────────────────
+    "וול ווש מגנטי 48V": {"lm": 1260, "w": 14, "cri": 90, "beam": 60, "cct": 3000, "brand": "Gaash style", "price": 310, "category": "וול ווש", "sku": "WW-48V", "mounting": "magnetic-48v", "ip": "IP20", "dimming": "DALI", "track_widths": [2.5], "sdcm": 3, "lifetime_l70_hours": 50000},
+    "וול ווש שקוע ליניארי": {"lm": 1500, "w": 16, "cri": 90, "beam": 65, "cct": 3000, "brand": "Generic", "price": 360, "category": "וול ווש", "sku": "WW-REC", "mounting": "recessed", "ip": "IP20", "dimming": "DALI", "length_m": 1.0, "lm_per_m": 1500, "sdcm": 3, "lifetime_l70_hours": 50000},
+    # ── Classic 230V track ───────────────────────────────────────────────
+    "ספוט מסלול 24deg": {"lm": 900, "w": 10, "cri": 92, "beam": 24, "cct": 3000, "brand": "TrackCo", "price": 155, "category": "מסלול קלאסי 230V", "sku": "TR230-24", "mounting": "track-230v", "ip": "IP20", "dimming": "Phase", "ugr_rated": 19, "sdcm": 3, "lifetime_l70_hours": 40000, "beam_variants": [15, 24, 36, 60]},
+    "ספוט מסלול 230V 38deg": {"lm": 1100, "w": 13, "cri": 90, "beam": 38, "cct": 3000, "brand": "TrackCo", "price": 175, "category": "מסלול קלאסי 230V", "sku": "TR230-38", "mounting": "track-230v", "ip": "IP20", "dimming": "Phase", "ugr_rated": 19, "sdcm": 3, "lifetime_l70_hours": 40000},
+    # ── Exterior IP65 ────────────────────────────────────────────────────
+    "ספוט חוץ IP65 24deg": {"lm": 850, "w": 12, "cri": 80, "beam": 24, "cct": 3000, "brand": "Outdoor", "price": 240, "category": "חוץ IP65", "sku": "EXT-24", "mounting": "surface", "ip": "IP65", "dimming": "None", "sdcm": 5, "lifetime_l70_hours": 50000},
+    "מקרן חוץ IP65 שטף": {"lm": 4200, "w": 50, "cri": 80, "beam": 90, "cct": 4000, "brand": "Outdoor", "price": 420, "category": "חוץ IP65", "sku": "EXT-FL50", "mounting": "surface", "ip": "IP65", "dimming": "None", "sdcm": 5, "lifetime_l70_hours": 50000},
+    # ── Pendants / chandelier ────────────────────────────────────────────
+    "תלוי פנדנט": {"lm": 1350, "w": 15, "cri": 90, "beam": 90, "cct": 3000, "brand": "PendantCo", "price": 280, "category": "פנדנט", "sku": "PD-15", "mounting": "suspended", "ip": "IP20", "dimming": "Phase/DALI", "sdcm": 3, "lifetime_l70_hours": 40000},
+    "נברשת דקורטיבית": {"lm": 3600, "w": 42, "cri": 90, "beam": 120, "cct": 2700, "brand": "PendantCo", "price": 980, "category": "נברשת", "sku": "CH-42", "mounting": "suspended", "ip": "IP20", "dimming": "Phase", "sdcm": 3, "lifetime_l70_hours": 30000},
+    "פנדנט אקוסטי": {"lm": 1980, "w": 22, "cri": 90, "beam": 100, "cct": 3000, "brand": "Acoustic", "price": 520, "category": "פנדנט", "sku": "PD-AC22", "mounting": "suspended", "ip": "IP20", "dimming": "DALI", "sdcm": 3, "lifetime_l70_hours": 50000},
+    # ── LED strip / profile (linear, lm/m) ───────────────────────────────
+    "רצועת LED 9.6W/m": {"lm": 4800, "w": 48, "cri": 90, "beam": 120, "cct": 3000, "brand": "Strip", "price": 350, "category": "רצועת LED", "sku": "STR-96", "mounting": "profile", "ip": "IP20", "dimming": "PWM", "length_m": 5.0, "lm_per_m": 960, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "רצועת LED 14.4W/m": {"lm": 6000, "w": 72, "cri": 90, "beam": 120, "cct": 3000, "brand": "Strip", "price": 480, "category": "רצועת LED", "sku": "STR-144", "mounting": "profile", "ip": "IP20", "dimming": "PWM", "length_m": 5.0, "lm_per_m": 1200, "sdcm": 3, "lifetime_l70_hours": 50000},
+    "פרופיל LED שקוע 24V": {"lm": 1100, "w": 12, "cri": 95, "beam": 110, "cct": 3000, "brand": "Profile", "price": 180, "category": "רצועת LED", "sku": "PRF-24V", "mounting": "recessed-profile", "ip": "IP20", "dimming": "PWM/DALI", "length_m": 1.0, "lm_per_m": 1100, "sdcm": 2, "lifetime_l70_hours": 50000},
+    # ── Cove (hidden indirect) ───────────────────────────────────────────
+    "תאורת קוב נסתרת": {"lm": 900, "w": 11, "cri": 90, "beam": 120, "cct": 2700, "brand": "Cove", "price": 160, "category": "קוב", "sku": "COVE-27", "mounting": "cove", "ip": "IP20", "dimming": "PWM", "length_m": 1.0, "lm_per_m": 900, "sdcm": 3, "lifetime_l70_hours": 50000},
+}
+
+DEFAULT_FIXTURES: Dict[str, Dict] = {name: normalize_fixture(data) for name, data in _RAW_FIXTURES.items()}
+
 MAGNETIC_TRACK_WIDTHS = [0.8, 1.3, 2.5]
+
+# Commercial fixture categories used by the normalized fixture schema (the optional
+# ``category`` field on each catalogue entry) and by the catalogue tab filtering.
+FIXTURE_CATEGORIES = [
+    "ספוט שקוע",          # recessed downlight / gimbal
+    "ספוט מתכוונן",        # adjustable / gimbal spot
+    "פס ליניארי",          # linear recessed / surface
+    "מגנטי 48V",          # magnetic 48V modules
+    "מסלול קלאסי 230V",   # classic 230V track
+    "וול ווש",            # wall washer
+    "פנדנט",              # pendant
+    "נברשת",              # chandelier
+    "חוץ IP65",           # exterior IP65
+    "רצועת LED",          # LED strip / profile
+    "קוב",                # cove
+    "אחר",                # other / uncategorised
+]
 
 DESIGN_PRESETS: Dict[str, Dict] = {
     "Modern Luxury": {"cct": "נייטרל (3000K)", "feeling": "Luxury", "language": "Architectural and minimal", "layers": "Hidden profiles, magnetic tracks, controlled pendants"},
@@ -4588,6 +4622,73 @@ UI_LABELS = {
 
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def room_index_value(width: float, length: float, ceiling_height: float, work_plane_h: float = 0.0) -> float:
+    """Room Index K = (L*W) / (Hm*(L+W)).
+
+    ``Hm`` is the luminaire mounting height above the working plane. The result is
+    clamped to the 0.6–5.0 band used by standard utilisation-factor tables.
+    """
+    hm = max(ceiling_height - work_plane_h, 0.1)
+    denom = hm * (width + length)
+    return clamp((width * length) / denom if denom else 1.0, 0.6, 5.0)
+
+
+def utilisation_factor(room_index: float, rho_ceiling: float, rho_walls: float, rho_floor: float) -> float:
+    """Lumen-method Utilisation Factor (a.k.a. Coefficient of Utilisation).
+
+    A compact analytic approximation of CIE/IES UF tables. UF grows with the room
+    index (less light lost to walls in large/low rooms) and with the three principal
+    surface reflectances (ceiling, walls and — unlike the previous version — the
+    floor cavity, which contributes inter-reflected flux back onto the work plane).
+    """
+    base = 0.33 + 0.12 * math.log(room_index + 0.5)
+    reflectance_gain = rho_ceiling * 0.05 + rho_walls * 0.04 + rho_floor * 0.03
+    return round(clamp(base + reflectance_gain, 0.20, 0.90), 3)
+
+
+def beam_intensity(angle_off_axis_deg: float, beam_angle_deg: float) -> float:
+    """Relative luminous intensity (0..1) of a generic beam at an off-axis angle.
+
+    Models a rotationally-symmetric beam whose full-width-half-maximum equals the
+    rated beam angle: a Gaussian profile normalised so that I = 0.5 at half the beam
+    angle and I -> 0 well outside the cone. Used as the photometric fallback when a
+    fixture has no linked IES/LDT candela distribution.
+    """
+    half = max(beam_angle_deg, 1.0) / 2.0
+    if half <= 0:
+        return 0.0
+    # exp(-ln2 * (theta/half)^2) gives exactly 0.5 at theta == half.
+    return math.exp(-math.log(2.0) * (angle_off_axis_deg / half) ** 2)
+
+
+_AXIAL_CD_CACHE: Dict[Tuple[int, int], float] = {}
+
+
+def axial_beam_intensity_cd(lumens: float, beam_angle_deg: float) -> float:
+    """On-axis luminous intensity (cd) for a :func:`beam_intensity` profile whose
+    total radiated flux integrates to ``lumens``.
+
+    Solves I0 from Phi = I0 * integral over the sphere of the normalised beam
+    shape, so that a fixture's full rated lumen output is conserved regardless of
+    beam angle. Results are memoised on rounded inputs for grid performance.
+    """
+    if lumens <= 0:
+        return 0.0
+    key = (int(round(lumens)), int(round(beam_angle_deg)))
+    cached = _AXIAL_CD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    steps = 90
+    integral = 0.0
+    for i in range(steps):
+        theta = (i + 0.5) * (math.pi / steps)
+        integral += beam_intensity(math.degrees(theta), beam_angle_deg) * math.sin(theta)
+    integral *= 2 * math.pi * (math.pi / steps)
+    val = lumens / max(integral, 1e-6)
+    _AXIAL_CD_CACHE[key] = val
+    return val
 
 
 @dataclass
@@ -4966,6 +5067,8 @@ class ModelGuard:
                 data["cri"] = clamp(float(data.get("cri", 90)), 0, 100)
                 data["beam"] = clamp(float(data.get("beam", 36)), 5, 160)
                 data["cct"] = int(clamp(float(data.get("cct", 3000)), 1500, 10000))
+                data.setdefault("currency", "ILS")
+                data["efficacy"] = fixture_efficacy(data)
             except Exception:
                 LOGGER.warning("Removing invalid fixture catalogue row: %s", name)
                 room.fixture_catalogue.pop(name, None)
@@ -5380,7 +5483,7 @@ class RoomModel:
     project_folder: str = ""
     last_modified: str = ""
     sticky_notes: List[dict] = field(default_factory=list)
-    project_snapshots: List[dict] = field(default_factory=list)
+    snapshots: List[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.layers:
@@ -5422,7 +5525,7 @@ class RoomModel:
             return max(1, int(lux))
         if self.lux_override:
             return self.lux_override
-        # Target illuminance is independent of colour temperature (EN 12464-1).
+        # Maintained illuminance target is independent of CCT (EN 12464-1).
         return max(1, int(LUX_STANDARDS.get(self.room_type, 200)))
 
     @property
@@ -5437,17 +5540,13 @@ class RoomModel:
 
     @property
     def room_index(self) -> float:
-        denom = self.ceiling_height * (self.width + self.length)
-        return clamp(self.area / denom if denom else 1.0, 0.6, 5.0)
+        return room_index_value(self.width, self.length, self.ceiling_height)
 
     @property
     def utilisation_factor(self) -> float:
-        # Coefficient of utilisation from Room Index (luminaire above work plane)
-        # and the ceiling/wall/floor reflectances. Replaces the old log-heuristic.
-        mount_h = max(0.2, self.ceiling_height - WORK_PLANE_M)
-        ri = room_index_value(self.width, self.length, mount_h)
-        return utilisation_factor(ri, self.reflectance_ceiling,
-                                  self.reflectance_walls, self.reflectance_floor)
+        """Lumen-method utilisation factor including floor reflectance (see
+        :func:`utilisation_factor`)."""
+        return utilisation_factor(self.room_index, self.reflectance_ceiling, self.reflectance_walls, self.reflectance_floor)
 
     def layer(self, i: int) -> LightingLayer:
         return self.layers[i] if i < len(self.layers) else LightingLayer("חסר", False, 0)
@@ -5483,20 +5582,15 @@ class RoomModel:
         room.tracks = [MagneticTrack.from_dict(x) for x in d.get("tracks", [])]
         room.pendants = [PendantConfig.from_dict(x) for x in d.get("pendants", [])] or room.pendants
         room.ambient = AmbientConfig.from_dict(d.get("ambient", {}))
-        if "fixture_catalogue" in d and d["fixture_catalogue"]:
-            # Respect the saved catalogue verbatim (deletions must persist).
+        if "fixture_catalogue" in d:
+            # Respect the saved catalogue verbatim so deleted defaults stay deleted.
             room.fixture_catalogue = dict(d["fixture_catalogue"])
         else:
             room.fixture_catalogue = dict(DEFAULT_FIXTURES)
-        # Guarantee the selected default spot fixture still resolves.
+        if not room.fixture_catalogue:
+            room.fixture_catalogue = dict(DEFAULT_FIXTURES)
         if room.default_spot_fixture not in room.fixture_catalogue:
-            if room.default_spot_fixture in DEFAULT_FIXTURES:
-                room.fixture_catalogue[room.default_spot_fixture] = dict(DEFAULT_FIXTURES[room.default_spot_fixture])
-            elif room.fixture_catalogue:
-                room.default_spot_fixture = next(iter(room.fixture_catalogue))
-            else:
-                room.fixture_catalogue = dict(DEFAULT_FIXTURES)
-                room.default_spot_fixture = next(iter(room.fixture_catalogue))
+            room.default_spot_fixture = next(iter(room.fixture_catalogue))
         room.zones = [LightingZone.from_dict(x) for x in d.get("zones", [])] or room.zones
         room.daylight = DaylightConfig.from_dict(d.get("daylight", {}))
         room.scenes = [LightingScene.from_dict(x) for x in d.get("scenes", [])] or room.scenes
@@ -5509,112 +5603,6 @@ class RoomModel:
         room.architectural_understanding = ArchitecturalUnderstanding.from_dict(d.get("architectural_understanding", {}))
         room.client_brief = ClientBrief.from_dict(d.get("client_brief", {}))
         return room
-
-
-# ──────────────────────────────────────────────────────────
-# PHOTOMETRY & UTILISATION FACTOR (physically grounded model)
-# ──────────────────────────────────────────────────────────
-# Work-plane height above the floor used for the lumen / utilisation method
-# (EN 12464-1 reference plane for typical seated/standing tasks).
-WORK_PLANE_M = 0.0  # point grid is evaluated at floor level for the heatmap
-
-# Reference utilisation factors for a typical direct (downlight/linear) luminaire
-# at ceiling/wall/floor reflectances of 0.70 / 0.50 / 0.20, indexed by Room Index.
-# Values follow published CIBSE/IES-style UF tables for a medium-distribution
-# direct fitting and are interpolated; reflectance deltas adjust the base value.
-_UF_REFERENCE = [
-    (0.60, 0.39), (0.80, 0.46), (1.00, 0.52), (1.25, 0.58),
-    (1.50, 0.62), (2.00, 0.68), (2.50, 0.72), (3.00, 0.75),
-    (4.00, 0.79), (5.00, 0.82),
-]
-
-
-def room_index_value(width: float, length: float, mount_h: float) -> float:
-    """Room Index RI = (W·L) / (Hm·(W+L)), Hm = luminaire height above work plane."""
-    denom = max(mount_h, 0.2) * (width + length)
-    if denom <= 0:
-        return 1.0
-    return clamp((width * length) / denom, 0.4, 6.0)
-
-
-def utilisation_factor(room_index: float, rho_c: float = 0.7,
-                       rho_w: float = 0.5, rho_f: float = 0.2) -> float:
-    """Coefficient of utilisation from Room Index + surface reflectances.
-
-    Base curve is for ρc/ρw/ρf = 0.70/0.50/0.20; small linear corrections are
-    applied for deviating reflectances. Ceiling & floor act mostly via the
-    inter-reflected component, walls matter more in small (low-RI) rooms.
-    """
-    ri = clamp(room_index, _UF_REFERENCE[0][0], _UF_REFERENCE[-1][0])
-    base = _UF_REFERENCE[-1][1]
-    for (r0, u0), (r1, u1) in zip(_UF_REFERENCE, _UF_REFERENCE[1:]):
-        if r0 <= ri <= r1:
-            f = (ri - r0) / max(r1 - r0, 1e-9)
-            base = u0 + f * (u1 - u0)
-            break
-    wall_gain = (rho_w - 0.5) * (0.18 / (ri + 0.5))   # stronger in small rooms
-    ceil_gain = (rho_c - 0.7) * 0.12
-    floor_gain = (rho_f - 0.2) * 0.06
-    return round(clamp(base + wall_gain + ceil_gain + floor_gain, 0.15, 0.92), 3)
-
-
-_BEAM_NORM_CACHE: Dict[int, float] = {}
-
-
-def _beam_sigma(beam_deg: float) -> float:
-    """Gaussian sigma (radians) so that FWHM equals the rated beam angle."""
-    half = math.radians(clamp(beam_deg, 5.0, 175.0) / 2.0)
-    return half / 1.1774  # half-angle at 50% peak => sigma = half / sqrt(2 ln2)
-
-
-def _beam_norm(beam_deg: float) -> float:
-    """K = 2π ∫ g(θ) sinθ dθ over the downward hemisphere for a unit-peak Gaussian.
-
-    Luminous intensity for a lamp of flux Φ is then I(θ) = Φ/K · g(θ).
-    """
-    key = int(round(clamp(beam_deg, 5.0, 175.0)))
-    cached = _BEAM_NORM_CACHE.get(key)
-    if cached is not None:
-        return cached
-    sigma = _beam_sigma(key)
-    steps = 180
-    total = 0.0
-    upper = math.pi / 2
-    dt = upper / steps
-    for i in range(steps):
-        th = (i + 0.5) * dt
-        g = math.exp(-(th * th) / (2 * sigma * sigma))
-        total += g * math.sin(th) * dt
-    k = max(2 * math.pi * total, 1e-6)
-    _BEAM_NORM_CACHE[key] = k
-    return k
-
-
-def beam_intensity(flux_lm: float, beam_deg: float, theta_deg: float) -> float:
-    """Luminous intensity (cd) of a normalised Gaussian beam of given flux."""
-    sigma = _beam_sigma(beam_deg)
-    th = math.radians(theta_deg)
-    g = math.exp(-(th * th) / (2 * sigma * sigma))
-    return flux_lm / _beam_norm(beam_deg) * g
-
-
-def _interp_photometry(photometry: Dict, theta_deg: float) -> float:
-    """Linear interpolation of stored {'v': angles, 'cd': candela} at vertical angle."""
-    angles = photometry.get("v") or []
-    cd = photometry.get("cd") or []
-    if not angles or not cd:
-        return 0.0
-    t = abs(theta_deg)
-    if t <= angles[0]:
-        return max(0.0, cd[0])
-    if t >= angles[-1]:
-        return max(0.0, cd[-1])
-    for i in range(len(angles) - 1):
-        a0, a1 = angles[i], angles[i + 1]
-        if a0 <= t <= a1:
-            f = (t - a0) / max(a1 - a0, 1e-9)
-            return max(0.0, cd[i] + f * (cd[i + 1] - cd[i]))
-    return max(0.0, cd[-1])
 
 
 class SpotlightPlanner:
@@ -5633,7 +5621,7 @@ class SpotlightPlanner:
             n = self.room.spot_quantity_override
         else:
             spot_lm = float(self.room.fixture_catalogue.get(self.room.default_spot_fixture, {}).get("lm", 800))
-            # Lumen method: total flux = E·A / (UF·MF); number of fixtures = flux / lm.
+            # Lumen Method: n = ceil(E * A / (Phi * UF * MF))
             required = self.room.lux_target * self.room.area / max(self.room.utilisation_factor * self.room.maintenance_factor, 0.01)
             n = max(1, math.ceil(required / max(spot_lm, 1)))
             max_by_spacing = max(1, (max(1, round(uw / s) + 1)) * (max(1, round(ul / s) + 1)))
@@ -5659,18 +5647,15 @@ class LuxEngine:
     def __init__(self, room: RoomModel):
         self.room = room
 
-    _FALLBACK_FIXTURE: Dict = {
-        "lm": 800, "w": 8, "cri": 90, "beam": 36, "cct": 3000,
-        "brand": "Generic", "price": 0,
-    }
+    _DEFAULT_FIXTURE = {"lm": 800, "w": 8, "cri": 90, "beam": 36, "cct": 3000, "brand": "Generic", "price": 0}
 
     def fixture(self, name: str) -> Dict:
-        cat = self.room.fixture_catalogue
-        if name in cat:
-            return cat[name]
-        if cat:
-            return next(iter(cat.values()))
-        return dict(self._FALLBACK_FIXTURE)
+        info = self.room.fixture_catalogue.get(name)
+        if info is not None:
+            return info
+        if self.room.fixture_catalogue:
+            return next(iter(self.room.fixture_catalogue.values()))
+        return dict(self._DEFAULT_FIXTURE)
 
     def required_lumens(self) -> float:
         if self.room.area <= 0:
@@ -5802,65 +5787,61 @@ class LuxEngine:
             return self.room.curtain_lighting.total_lm / count
         return float(self.fixture(name).get("lm", 800))
 
-    def _avg_reflectance(self) -> float:
-        a_horiz = self.room.area  # ceiling and floor each
-        a_walls = 2 * (self.room.width + self.room.length) * self.room.ceiling_height
-        total_area = 2 * a_horiz + a_walls
-        if total_area <= 0:
-            return 0.4
-        return (self.room.reflectance_ceiling * a_horiz +
-                self.room.reflectance_floor * a_horiz +
-                self.room.reflectance_walls * a_walls) / total_area
-
-    def _scene_cache(self) -> Dict:
-        """Cache scene-wide constants reused across every grid point."""
-        cache = getattr(self, "_cache", None)
-        if cache is not None:
-            return cache
-        sources = self.all_sources()
-        total_flux = sum(self.source_lumens(name) * factor
-                         for _, _, name, _, factor in sources)
-        uf = self.room.utilisation_factor
-        rho = self._avg_reflectance()
-        # Inter-reflected (indirect) share of the utilised flux. Scaled down from the
-        # mean reflectance because direct luminaires deliver most flux to the task
-        # plane directly; only a portion arrives via wall/ceiling inter-reflection.
-        split = clamp(rho * 0.5, 0.08, 0.35)
-        area = max(self.room.area, 0.01)
-        # Split-flux: uniform inter-reflected illuminance on the work plane.
-        indirect_uniform = total_flux * uf * split / area
-        cache = {
-            "sources": sources, "uf": uf, "split": split,
-            "indirect": indirect_uniform,
-        }
-        self._cache = cache
-        return cache
+    def _beam_for(self, name: str) -> float:
+        if name in {"__profile__", "__ambient__", "__curtain__"}:
+            return 120.0
+        return float(self.fixture(name).get("beam", 90))
 
     def point_lux(self, px: float, py: float) -> float:
-        c = self._scene_cache()
-        uf, split = c["uf"], c["split"]
+        """Direct + indirect (split-flux) illuminance at a floor point (lux).
+
+        Direct term: each source is treated as a point luminaire aimed at nadir.
+        If the fixture carries IES-derived peak intensity (``ies_peak_cd``) we use
+        that as the on-axis candela; otherwise the on-axis intensity is derived from
+        the rated lumens via :func:`axial_beam_intensity_cd` so total flux is
+        conserved. Intensity at the off-axis angle uses the normalised beam profile,
+        and illuminance follows the inverse-square + cosine law
+        ``E = I(theta) * cos(incidence) / d^2`` with ``cos(incidence) = h/d``.
+
+        Indirect term: a simple split-flux estimate adds inter-reflected light from
+        the room surfaces, scaled by the effective reflectance.
+        """
         direct = 0.0
-        for sx, sy, name, h, layer_factor in c["sources"]:
+        total_lumens = 0.0
+        for sx, sy, name, h, layer_factor in self.all_sources():
             dx, dy = px - sx, py - sy
-            r = math.sqrt(dx * dx + dy * dy)
+            r = math.hypot(dx, dy)
             d = math.sqrt(r * r + h * h)
-            if d <= 0.05:
-                d = 0.05
-            theta_deg = math.degrees(math.atan2(r, max(h, 0.05)))
-            info = self.fixture(name) if name not in ("__profile__", "__ambient__", "__curtain__") else {}
-            photometry = info.get("photometry") if info else None
-            if photometry and photometry.get("cd"):
-                # Real IES/LDT candela (rotationally averaged), scaled by layer dimming.
-                intensity_cd = _interp_photometry(photometry, theta_deg) * layer_factor
+            theta_deg = math.degrees(math.atan2(r, max(h, 1e-3)))
+            lumens = self.source_lumens(name) * layer_factor
+            total_lumens += lumens
+            beam = self._beam_for(name)
+            info = self.fixture(name) if name not in {"__profile__", "__ambient__", "__curtain__"} else {}
+            peak_cd = float(info.get("ies_peak_cd", 0) or 0)
+            if peak_cd > 0:
+                intensity = peak_cd * beam_intensity(theta_deg, beam)
             else:
-                lumens = self.source_lumens(name) * layer_factor
-                beam = float(info.get("beam", 90)) if info else 120
-                intensity_cd = beam_intensity(lumens, beam, theta_deg)
-            cos_theta = clamp(h / d, 0.0, 1.0)
-            direct += intensity_cd * cos_theta / (d * d)
-        # Direct utilised + uniform indirect (split-flux), both reduced by maintenance.
-        artificial = (direct * uf * (1.0 - split) + c["indirect"]) * self.room.maintenance_factor
-        value = artificial + DaylightEngine(self.room).point_lux(px, py)
+                intensity = axial_beam_intensity_cd(lumens, beam) * beam_intensity(theta_deg, beam)
+            cos_incidence = clamp(h / d, 0.0, 1.0)
+            direct += intensity * cos_incidence / max(d * d, 0.05)
+        direct *= self.room.maintenance_factor
+
+        # Split-flux indirect term: inter-reflected component over the work plane.
+        rho_eff = clamp(
+            0.30 * self.room.reflectance_ceiling
+            + 0.50 * self.room.reflectance_walls
+            + 0.20 * self.room.reflectance_floor,
+            0.0, 0.95,
+        )
+        indirect = 0.0
+        if total_lumens > 0 and self.room.area > 0:
+            indirect = (
+                total_lumens * rho_eff * (1.0 - rho_eff)
+                / max(self.room.area, 0.1)
+                * self.room.maintenance_factor
+            )
+
+        value = direct + indirect + DaylightEngine(self.room).point_lux(px, py)
         for furn in self.room.furniture:
             if furn.enabled and furn.contains(self.room, px, py):
                 value *= max(0.0, 1.0 - furn.shadow_factor)
@@ -5903,56 +5884,55 @@ class LuxEngine:
     def ugr_estimate(self) -> float:
         """Simplified CIE 117 Unified Glare Rating.
 
-        UGR = 8·log10( (0.25/Lb) · Σ L²·ω / p² )
+        UGR = 8 * log10( (0.25 / Lb) * Σ (L^2 * ω / p^2) ).
 
-        Assumptions (documented approximation):
-          • Single observer at room centre, eye height 1.2 m, looking horizontally.
-          • Luminaires are treated as small sources in the vertical plane of view
-            (Guth azimuth a≈0), so the position index reduces to
-            p = exp(0.03398·σ + 0.00021·σ²) with σ the elevation from the line of sight.
-          • Background luminance Lb = E_avg·ρ_avg/π (inter-reflected surfaces).
-          • Each ceiling source has a luminous area from its 'lum_area_m2' field
-            (default 0.05 m²); intensity toward the eye uses the same photometry /
-            Gaussian beam model as the illuminance calculation.
-        Only direct ceiling sources are considered (profiles/ambient/curtain are
-        low-luminance indirect elements and are excluded).
+        Documented assumptions: a single standard observer positioned at mid-width,
+        0.5 m from the rear wall, eye height 1.2 m, looking horizontally into the
+        room (+y). Each luminaire is treated as a downward-aimed source; its
+        intensity toward the observer comes from the IES peak candela (when known)
+        or the lumen-normalised beam model, its luminance from an effective luminous
+        area scaled with lumen output, and its Guth position index is approximated
+        from the angular displacement off the line of sight. Background luminance Lb
+        is derived from the inter-reflected (indirect) illuminance and the wall
+        reflectance. This is an estimate, not a substitute for full ray-traced UGR.
         """
-        eye_h = 1.2
-        ex, ey = self.room.width / 2.0, self.room.length / 2.0
-        rho = self._avg_reflectance()
-        bg = max(1.0, self.achieved_average_lux() * rho / math.pi)
+        sources = self.all_sources()
+        if not sources:
+            return 10.0
+        ex, ey, ez = self.room.width / 2.0, 0.5, 1.2
+        view = (0.0, 1.0, 0.0)
+        avg = max(self.achieved_average_lux(), 1.0)
+        lb = max(avg * self.room.reflectance_walls / math.pi, 1.0)
         summation = 0.0
-        for sx, sy, name, h, layer_factor in self.all_sources():
-            if name in ("__profile__", "__ambient__", "__curtain__"):
+        special = {"__profile__", "__ambient__", "__curtain__"}
+        for sx, sy, name, h, layer_factor in sources:
+            vx, vy, vz = sx - ex, sy - ey, h - ez
+            r = math.sqrt(vx * vx + vy * vy + vz * vz)
+            if r < 0.25:
                 continue
-            dh = h - eye_h
-            if dh <= 0.05:
+            lumens = self.source_lumens(name) * layer_factor
+            if lumens <= 0:
                 continue
-            r = math.hypot(sx - ex, sy - ey)
-            d = math.hypot(r, dh)
-            # σ: elevation of the source above the (horizontal) line of sight.
-            sigma_deg = math.degrees(math.atan2(dh, max(r, 1e-3)))
-            # θ: emission angle of the luminaire toward the eye, from its nadir.
-            theta_deg = math.degrees(math.atan2(r, dh))
-            info = self.fixture(name)
-            photometry = info.get("photometry")
-            if photometry and photometry.get("cd"):
-                intensity_cd = _interp_photometry(photometry, theta_deg) * layer_factor
-            else:
-                lumens = self.source_lumens(name) * layer_factor
-                beam = float(info.get("beam", 90))
-                intensity_cd = beam_intensity(lumens, beam, theta_deg)
-            if intensity_cd <= 0:
+            beam = self._beam_for(name)
+            dox, doy, doz = ex - sx, ey - sy, ez - h
+            dd = math.sqrt(dox * dox + doy * doy + doz * doz)
+            gamma = math.degrees(math.acos(clamp(-doz / max(dd, 1e-6), -1.0, 1.0)))
+            info = self.fixture(name) if name not in special else {}
+            peak_cd = float(info.get("ies_peak_cd", 0) or 0)
+            base_cd = peak_cd if peak_cd > 0 else axial_beam_intensity_cd(lumens, beam)
+            intensity = base_cd * beam_intensity(gamma, beam)
+            if intensity <= 0:
                 continue
-            lum_area = max(0.005, float(info.get("lum_area_m2", 0.05)))
-            # Solid angle of the source at the eye (projected area / d²).
-            omega = lum_area * clamp(dh / d, 0.0, 1.0) / max(d * d, 1e-4)
-            luminance = intensity_cd / lum_area
-            p = math.exp(0.03398 * sigma_deg + 0.00021 * sigma_deg * sigma_deg)
-            summation += (luminance * luminance) * omega / (p * p)
+            area = clamp(lumens / 120000.0, 0.0025, 0.5)
+            luminance = intensity / area
+            omega = area * (abs(doz) / max(dd, 1e-6)) / max(r * r, 1e-4)
+            dot = (vx * view[0] + vy * view[1] + vz * view[2]) / max(r, 1e-6)
+            sigma = math.degrees(math.acos(clamp(dot, -1.0, 1.0)))
+            position_index = math.exp(sigma / 25.0)
+            summation += (luminance * luminance * omega) / max(position_index * position_index, 1e-3)
         if summation <= 0:
-            return 0.0
-        ugr = 8 * math.log10(max(0.25 / bg * summation, 1e-6))
+            return 10.0
+        ugr = 8 * math.log10(max(0.25 / lb * summation, 1e-6))
         return round(clamp(ugr, 5.0, 35.0), 1)
 
 
@@ -6008,10 +5988,9 @@ class ComplianceEngine:
         ugr = self.lux.ugr_estimate()
         cri = self.lux.avg_cri()
         lpd = self.lux.watts_total() / max(self.room.area, 0.01)
-        u0_min = uniformity_target(self.room.room_type)
         return [
             ("EN 12464 Illuminance", 0.9 * target <= avg <= 1.25 * target, f"{avg:.0f} lx מול יעד {target} lx"),
-            ("EN 12464 Uniformity", uniformity >= u0_min, f"U0={uniformity:.2f} (מינימום {u0_min:.2f})"),
+            ("EN 12464 Uniformity", uniformity >= uniformity_target(self.room.room_type), f"U0={uniformity:.2f} (מינימום {uniformity_target(self.room.room_type):.2f})"),
             ("EN 12464 UGR", ugr <= UGR_LIMITS.get(self.room.room_type, 22), f"UGR {ugr} / {UGR_LIMITS.get(self.room.room_type, 22)}"),
             ("CRI", cri >= CRI_STANDARDS.get(self.room.room_type, 80), f"CRI {cri:.0f} / {CRI_STANDARDS.get(self.room.room_type, 80)}"),
             ("ASHRAE-style LPD", lpd <= LPD_LIMITS_W_M2.get(self.room.room_type, 12), f"{lpd:.1f} W/m2 / {LPD_LIMITS_W_M2.get(self.room.room_type, 12)}"),
@@ -6077,7 +6056,7 @@ class ZoneEngine:
                     "avg": avg,
                     "min": min_lux,
                     "uniformity": min_lux / avg if avg else 0,
-                    "ok": 0.9 * zone.lux_target <= avg <= 1.3 * zone.lux_target and (min_lux / avg if avg else 0) >= 0.40,
+                    "ok": 0.9 * zone.lux_target <= avg <= 1.3 * zone.lux_target and (min_lux / avg if avg else 0) >= uniformity_target(self.room.room_type),
                 }
             )
         return rows
@@ -6120,21 +6099,21 @@ class ValidationEngine:
         min_lux = min(vals) if vals else 0
         max_lux = max(vals) if vals else 0
         issues: List[Tuple[str, str, str]] = []
-        u0_min = uniformity_target(self.room.room_type)
         if avg < self.room.lux_target * 0.9:
-            issues.append(("תאורה חלשה מדי", f"ממוצע {avg:.0f} lx נמוך מהיעד {self.room.lux_target} lx.", "הוסף גופים, הגבר תפוקה או מקד תאורת משימה באזורים."))
+            issues.append(("תת-תאורה", f"ממוצע {avg:.0f} lx מתחת ליעד {self.room.lux_target} lx.", "הוסף גופים, הגבר עוצמה או מקד תאורת משימה באזורים."))
         if avg > self.room.lux_target * 1.35:
-            issues.append(("תאורה חזקה מדי", f"ממוצע {avg:.0f} lx גבוה משמעותית מהיעד.", "הפחת כמות, עמעם שכבות או הקטן תפוקת לומן."))
-        if avg and min_lux / avg < u0_min:
-            issues.append(("אחידות", f"יחס מינימום/ממוצע הוא {min_lux / avg:.2f} (יעד {u0_min:.2f}).", "צמצם מרווחים, הוסף תאורת מילוי או הרחק גופים מצבירים."))
+            issues.append(("עודף תאורה", f"ממוצע {avg:.0f} lx גבוה משמעותית מהיעד.", "הפחת כמות, עמעם שכבות או בחר גוף עם פחות לומן."))
+        u0_target = uniformity_target(self.room.room_type)
+        if avg and min_lux / avg < u0_target:
+            issues.append(("אחידות", f"יחס מינימום/ממוצע הוא {min_lux / avg:.2f} (יעד {u0_target:.2f}).", "צמצם מרווחים, הוסף תאורת מילוי או הרחק גופים מצבירים."))
         if max_lux > self.room.lux_target * 2.5:
-            issues.append(("נקודות חמות", f"ערך השיא בגריד הוא {max_lux:.0f} lx.", "הרחב זווית אלומה או הפחת חפיפת גופים."))
+            issues.append(("נקודות חמות", f"ערך השיא ברשת הוא {max_lux:.0f} lx.", "הרחב זווית אלומה או הפחת גופים חופפים."))
         for i, (x, y) in enumerate(SpotlightPlanner(self.room).active_positions(), 1):
             if min(x, y, self.room.width - x, self.room.length - y) < 0.18:
                 issues.append(("התנגשות", f"ספוט {i} קרוב מדי לקיר.", "הרחק אותו לפחות 0.18 מ׳ מגבולות החדר."))
             for furn in self.room.furniture:
                 if furn.enabled and furn.contains(self.room, x, y, 0.12):
-                    issues.append(("חפיפת ריהוט", f"ספוט {i} חופף את {furn.name}.", "הזז את הגוף או נצל ריהוט זה כאזור תאורת משימה."))
+                    issues.append(("חפיפה עם ריהוט", f"ספוט {i} חופף ל{furn.name}.", "הזז את הגוף או השתמש בריהוט זה כאזור תאורת משימה."))
         for p in self.room.pendants:
             if p.enabled and self.room.ceiling_height - p.drop_m < 1.9:
                 issues.append(("גובה פנדנט", f"גובה תחתית {p.name} נמוך מ-1.90 מ׳.", "הקטן את הצניחה או מקם מעל שולחן/אי."))
@@ -6218,15 +6197,15 @@ class BeamAnalysisEngine:
         for idx, fp in enumerate(fps, 1):
             where = f"x={fp.target_x:.2f}m, y={fp.target_y:.2f}m"
             if fp.overlap_count >= 3:
-                issues.append(("Excessive beam overlap", f"Beam {idx} has {fp.overlap_count} overlaps near {where}.", "Increase spacing, lower intensity, or use a narrower beam."))
+                issues.append(("חפיפת אלומות מוגזמת", f"לאלומה {idx} יש {fp.overlap_count} חפיפות סמוך ל-{where}.", "הגדל מרווח, הפחת עוצמה או השתמש באלומה צרה יותר."))
             if fp.hotspot:
-                issues.append(("Beam hotspot", f"Beam {idx} center is {fp.lux_center:.0f} lx near {where}.", "Reduce output, tilt away from the hotspot, or widen distribution."))
+                issues.append(("נקודה חמה באלומה", f"מרכז אלומה {idx} הוא {fp.lux_center:.0f} lx סמוך ל-{where}.", "הפחת עוצמה, הטה הצידה מהנקודה החמה או הרחב פיזור."))
             if fp.shadow_gap:
-                issues.append(("Shadow gap", f"Coverage drops between beam footprints near {where}.", "Add fill light or reduce fixture spacing."))
+                issues.append(("פער צללים", f"הכיסוי יורד בין טביעות האלומה סמוך ל-{where}.", "הוסף תאורת מילוי או צמצם מרווח בין גופים."))
         if self.room.room_type in ("משרד", "Office", "Workspace") and self.room.beam_angle < 24:
-            issues.append(("Wrong beam angle", "Narrow beams can create scallops in work areas.", "Use 36-60 degree optics for uniform task lighting."))
+            issues.append(("זווית אלומה שגויה", "אלומות צרות עלולות ליצור צלליות באזורי עבודה.", "השתמש באופטיקה של 36-60 מעלות לתאורת משימה אחידה."))
         if self.room.reflectance_floor < 0.18 or self.room.reflectance_walls < 0.25:
-            issues.append(("Low reflectance absorption", "Dark surfaces reduce beam diffusion and increase contrast.", "Increase fixture density or use wider optics/indirect light."))
+            issues.append(("בליעת אור מוגברת", "משטחים כהים מפחיתים פיזור אלומה ומגבירים ניגודיות.", "הגבר צפיפות גופים או השתמש באופטיקה רחבה/אור עקיף."))
         return issues
 
 
@@ -7149,9 +7128,11 @@ class LightingApp(QMainWindow):
         self.state = ProjectStateManager()
         self.simulation = LightingSimulationService()
         self.undo_stack = UndoStack()
-        # When True, recalculate() will not push a new undo snapshot. Used while
-        # restoring state (undo/redo/open/snapshot) so we never clobber redo history.
-        self._suppress_undo_push = False
+        # When True, recalculate() will not push onto the undo stack. Set while
+        # restoring state (undo/redo/open/new) so restoring does not destroy redo
+        # history or create spurious entries.
+        self._suppress_undo_push: bool = False
+        self._last_undo_push_ts: float = 0.0
         self._layers_tab_widget: object = None
         self._view_mode: str = "designer"
         self.grid_snap = GridSnap(0.10, enabled=True)
@@ -7167,13 +7148,7 @@ class LightingApp(QMainWindow):
         self._build_toolbar()
         if _V8_TEAM_LOADED:
             build_toolbar_v8(self)
-        # Suppress recalculation while widgets are created/populated, otherwise every
-        # initial setValue/setCurrentText fires a full simulation (dozens of times).
-        self._building = True
-        try:
-            self._build_ui()
-        finally:
-            self._building = False
+        self._build_ui()
         self.recalculate()
 
     def _build_menu(self) -> None:
@@ -7184,7 +7159,6 @@ class LightingApp(QMainWindow):
             ("שמור", self.save_project, "Ctrl+S"),
             ("שמור בשם...", self.save_project_as, "Ctrl+Shift+S"),
             ("ייבא קטלוג גופים...", self.import_catalogue, ""),
-            ("ייצא קטלוג גופים...", self.export_catalogue, ""),
             ("ייבא תכנית רקע...", self.import_floor_plan, ""),
             ("ייצא DXF...", self.export_dxf, ""),
             ("ייצא הצעת מחיר...", self.export_quote, ""),
@@ -7204,11 +7178,11 @@ class LightingApp(QMainWindow):
         self.main_toolbar = tb
         self.addToolBar(tb)
         # V8: Undo/Redo actions with keyboard shortcuts
-        undo_act = QAction("↩ בטל", self)
+        undo_act = QAction("↩ ביטול", self)
         undo_act.setShortcut("Ctrl+Z")
         undo_act.triggered.connect(self._undo)
         tb.addAction(undo_act)
-        redo_act = QAction("↪ בצע שוב", self)
+        redo_act = QAction("↪ ביצוע מחדש", self)
         redo_act.setShortcut("Ctrl+Y")
         redo_act.triggered.connect(self._redo)
         tb.addAction(redo_act)
@@ -7223,7 +7197,7 @@ class LightingApp(QMainWindow):
         html_act.triggered.connect(self.export_client_html)
         tb.addAction(html_act)
         tb.addSeparator()
-        for text, slot in [("חדש", self.new_project), ("פתח", self.open_project), ("שמור", self.save_project), ("קטלוג", self.import_catalogue), ("תכנית", self.import_floor_plan), ("DXF", self.export_dxf), ("📄 PDF", self.export_quote), ("חשמל", self.export_energy_report)]:
+        for text, slot in [("חדש", self.new_project), ("פתח", self.open_project), ("שמור", self.save_project), ("ייבא קטלוג", self.import_catalogue), ("ייצא קטלוג", self.export_catalogue), ("תכנית", self.import_floor_plan), ("DXF", self.export_dxf), ("📄 PDF", self.export_quote), ("חשמל", self.export_energy_report)]:
             a = QAction(text, self)
             a.triggered.connect(slot)
             tb.addAction(a)
@@ -7354,7 +7328,7 @@ class LightingApp(QMainWindow):
         self._sticky_notes = StickyNotesPanel()
         self.results.addTab(self._sticky_notes, "📌 הערות")
         self._snapshots = SnapshotsPanel()
-        self._snapshots.set_room_provider(self._snapshot_room_dict)
+        self._snapshots.set_room_provider(lambda: self.room.to_dict())
         self._snapshots.restoreRequested.connect(self._restore_snapshot)
         self.results.addTab(self._snapshots, "📷 גרסאות")
 
@@ -8688,8 +8662,14 @@ class LightingApp(QMainWindow):
             self._render_pricing()
             self._render_3d_preview(snap.lux)
             self.state.mark_dirty()
+            # Only snapshot meaningful, user-initiated states. Suppressed while
+            # restoring (undo/redo/open/new); throttled so a rapid drag of a single
+            # spinbox coalesces into one undo entry instead of spamming the stack.
             if not self._suppress_undo_push:
-                self._schedule_undo_push()
+                now = time.time()
+                if now - self._last_undo_push_ts >= 0.4:
+                    self.undo_stack.push(self.room.to_dict())
+                    self._last_undo_push_ts = now
             if _V8_TEAM_LOADED and hasattr(self, "_renderer_stack"):
                 self._renderer_stack.setCurrentIndex(1)
             if hasattr(self, "kpi_row") and self._last_snapshot:
@@ -8732,7 +8712,7 @@ class LightingApp(QMainWindow):
         cards = []
         for num, title, ok, detail in steps:
             color = P["green"] if ok else P["amber"]
-            state = "מוכן" if ok else "להמשך"
+            state = "מוכן" if ok else "בהמתנה"
             cards.append(
                 f"<tr>"
                 f"<td class='dot' style='background:{color}'>{num}</td>"
@@ -8879,22 +8859,11 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
             f"<tr><td>{name}</td><td style='color:{P['green'] if ok else P['red']};font-weight:800'>{'PASS' if ok else 'FAIL'}</td><td>{detail}</td></tr>"
             for name, ok, detail in comp.checks()
         )
-        note = ""
-        if self.room.room_type in NON_WORKPLACE_ROOM_TYPES:
-            note = (f"<p style='color:{P['amber']}'>שים לב: EN 12464-1 הוא תקן לתאורת "
-                    f"מקומות עבודה ואינו חל ישירות על חללי מגורים. הערכים עבור "
-                    f"\"{self.room.room_type}\" הם יעדי תכנון מומלצים בלבד.</p>")
-        ambient_zone = LUX_AMBIENT_ZONES.get(self.room.room_type)
-        if ambient_zone:
-            note += (f"<p style='color:{P['muted']}'>יעד משימה {self.room.lux_target} lx; "
-                     f"מומלץ אזור היקפי/סובב של כ-{ambient_zone} lx.</p>")
         self.compliance_text.setHtml(f"""
 <style>body{{direction:rtl;color:{P['text']};font-family:Segoe UI}} table{{width:100%;border-collapse:collapse}} td{{border-bottom:1px solid {P['border']};padding:6px}}</style>
-<h3 style="color:{P['green']}">תאימות לתקן EN 12464-1</h3>
+<h3 style="color:{P['green']}">Compliance</h3>
 <table>{rows}</table>
-{note}
-<p>אומדן קרדיט יעילות בסגנון LEED: <b style="color:{P['green']}">{comp.leed_score()} / 6</b></p>
-<p style="color:{P['muted']};font-size:11px">חישוב לוקס: מודל ישיר (קנדלה/אלומה) + עקיף מפושט (split-flux). UGR לפי CIE 117 מפושט. לאימות סופי השתמש ב-DIALux/Relux.</p>
+<p>LEED-style efficiency credit estimate: <b style="color:{P['green']}">{comp.leed_score()} / 6</b></p>
 """)
 
     def _render_zones(self, lux: LuxEngine) -> None:
@@ -8955,30 +8924,30 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
     def _render_catalogue(self) -> None:
         library = FixtureLibraryEngine(self.room.fixture_catalogue)
         fixtures = library.filter(min_cri=0)
-
-        def _eff(d):
-            return d.get("efficacy") or round(float(d.get("lm", 0)) / max(float(d.get("w", 1)), 0.1), 1)
-        rows = "".join(
-            f"<tr><td>{'★ ' if d.get('favorite') else ''}{name}</td>"
-            f"<td>{d.get('category','-')}</td><td>{d.get('brand','-')}</td>"
-            f"<td>{d.get('lm',0):.0f}</td><td>{d.get('w',0):.0f}</td>"
-            f"<td>{_eff(d):.0f}</td><td>{d.get('cri',0):.0f}</td>"
-            f"<td>{d.get('cct',0)}K</td><td>{d.get('beam',0):.0f}°</td>"
-            f"<td>{d.get('ip','-')}</td><td>₪{float(d.get('price',0)):,.0f}</td></tr>"
-            for name, d in fixtures.items()
-        )
-        # Category / CCT / CRI / IP summary so the user can scan the library quickly.
-        cats = sorted({str(d.get("category", "-")) for d in fixtures.values()})
-        ccts = sorted({int(d.get("cct", 0)) for d in fixtures.values()})
-        ips = sorted({str(d.get("ip", "-")) for d in fixtures.values()})
-        cris = sorted({int(d.get("cri", 0)) for d in fixtures.values()})
-        summary = (f"קטגוריות: {', '.join(cats)} | CCT: {', '.join(str(c) + 'K' for c in ccts)} | "
-                   f"CRI: {', '.join(str(c) for c in cris)} | IP: {', '.join(ips)}")
+        # group rows by category for at-a-glance filtering by type
+        by_category: Dict[str, List[Tuple[str, Dict]]] = {}
+        for name, d in fixtures.items():
+            by_category.setdefault(d.get("category", "אחר"), []).append((name, d))
+        blocks = []
+        header = ("<tr><td>שם</td><td>קטגוריה</td><td>מותג</td><td>lm</td><td>W</td>"
+                  "<td>lm/W</td><td>CRI</td><td>CCT</td><td>Beam</td><td>IP</td><td>עמעום</td><td>מחיר ₪</td></tr>")
+        for cat in sorted(by_category):
+            rows = "".join(
+                f"<tr><td>{'★ ' if d.get('favorite') else ''}{name}</td>"
+                f"<td>{d.get('category','אחר')}</td><td>{d.get('brand','-')}</td>"
+                f"<td>{d.get('lm',0):.0f}</td><td>{d.get('w',0):.0f}</td>"
+                f"<td>{d.get('efficacy', fixture_efficacy(d)):.0f}</td>"
+                f"<td>{d.get('cri',0):.0f}</td><td>{d.get('cct',0)}K</td>"
+                f"<td>{d.get('beam',0):.0f}°</td><td>{d.get('ip','-')}</td>"
+                f"<td>{d.get('dimming','-')}</td><td>{d.get('price',0):.0f}</td></tr>"
+                for name, d in by_category[cat]
+            )
+            blocks.append(f"<h4 style='color:{P['amber']};margin:10px 0 4px'>{cat} ({len(by_category[cat])})</h4>"
+                          f"<table>{header}{rows}</table>")
         self.catalogue_text.setHtml(f"""
-<style>body{{direction:rtl;color:{P['text']};font-family:Segoe UI}} table{{width:100%;border-collapse:collapse}} td{{border-bottom:1px solid {P['border']};padding:5px}} .sum{{color:{P['muted']};font-size:11px;margin-bottom:8px}}</style>
-<h3 style="color:{P['blue']}">קטלוג גופי תאורה ({len(fixtures)})</h3>
-<div class="sum">{summary}</div>
-<table><tr><td>שם</td><td>קטגוריה</td><td>מותג</td><td>lm</td><td>W</td><td>lm/W</td><td>CRI</td><td>CCT</td><td>Beam</td><td>IP</td><td>מחיר</td></tr>{rows}</table>
+<style>body{{direction:rtl;color:{P['text']};font-family:Segoe UI}} table{{width:100%;border-collapse:collapse;margin-bottom:6px}} td{{border-bottom:1px solid {P['border']};padding:5px;font-size:12px}}</style>
+<h3 style="color:{P['blue']}">קטלוג גופי תאורה — {len(fixtures)} גופים, {len(by_category)} קטגוריות</h3>
+{''.join(blocks)}
 """)
 
     def _render_energy(self) -> None:
@@ -9006,12 +8975,12 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
         price = PricingEngine(self.room)
         totals = price.totals()
         electrical = ElectricalEngine(self.room, LuxEngine(self.room)).summary()
-        rows = "".join(f"<tr><td>{name}</td><td>{qty}</td><td>₪{unit:,.2f}</td><td>₪{total:,.2f}</td></tr>" for name, qty, unit, total in price.line_items())
+        rows = "".join(f"<tr><td>{name}</td><td>{qty}</td><td>{unit:.2f}</td><td>{total:.2f}</td></tr>" for name, qty, unit, total in price.line_items())
         self.pricing_text.setHtml(f"""
 <style>body{{direction:rtl;color:{P['text']};font-family:Segoe UI}} table{{width:100%;border-collapse:collapse}} td{{border-bottom:1px solid {P['border']};padding:6px}}</style>
-<h3 style="color:{P['green']}">תמחור אוטומטי ועומס חשמלי (₪ ILS)</h3>
-<table><tr><td>פריט</td><td>כמות</td><td>יחידה</td><td>סה"כ</td></tr>{rows}</table>
-<p>חומרים: <b>₪{totals['material']:,.2f}</b> | תוספת רווח: <b>₪{totals['markup']:,.2f}</b> | עבודה: <b>₪{totals['labour']:,.2f}</b> | אומדן כולל: <b style="color:{P['green']}">₪{totals['total']:,.2f}</b></p>
+<h3 style="color:{P['green']}">Auto pricing and electrical load</h3>
+<table><tr><td>Item</td><td>Qty</td><td>Unit</td><td>Total</td></tr>{rows}</table>
+<p>Material: <b>{totals['material']:.2f}</b> | Markup: <b>{totals['markup']:.2f}</b> | Labor: <b>{totals['labour']:.2f}</b> | Total estimate: <b style="color:{P['green']}">{totals['total']:.2f}</b></p>
 <p>Electrical load: <b>{electrical['watts']:.0f} W</b> | <b>{electrical['amps']:.2f} A</b> @ {electrical['voltage']:.0f}V | Recommended circuits: <b>{electrical['circuits']:.0f}</b></p>
 <p>Energy score: <b style="color:{P['green']}">{electrical['efficiency_score']:.0f}/100</b> | Monthly estimate: <b>{electrical['monthly_kwh']:.1f} kWh</b> | CO2 estimate: <b>{electrical['co2_kg']:.1f} kg/month</b></p>
 """)
@@ -9115,18 +9084,20 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
         self._refresh_all_controls()
 
     def _refresh_all_controls(self) -> None:
-        # Suppress the per-widget recalculate() while we push model values into the
-        # controls; otherwise an early setValue triggers _read_inputs mid-refresh and
-        # clobbers values that haven't been written to their widgets yet.
-        was_building = self._building
+        # Suppress the per-widget recalculate cascade while we push model values
+        # into the controls; otherwise an early widget's signal triggers
+        # recalculate()->_read_inputs() which reads not-yet-updated inputs (e.g.
+        # lux_in) and clobbers the model (lux_override). One recalc runs at the end.
+        prev_building = self._building
         self._building = True
         try:
-            self._refresh_all_controls_inner()
+            self._refresh_all_controls_body()
         finally:
-            self._building = was_building
+            self._building = prev_building
+        self._rebuild_layers_tab()
         self.recalculate()
 
-    def _refresh_all_controls_inner(self) -> None:
+    def _refresh_all_controls_body(self) -> None:
         self.room_type.setCurrentText(self.room.room_type)
         self.width_in.setValue(self.room.width)
         self.length_in.setValue(self.room.length)
@@ -9160,9 +9131,12 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
             self.track_fix.clear()
             track_width = self.room.tracks[0].width_cm if self.room.tracks else 2.5
             self.track_fix.addItems(self._track_fixture_options(track_width))
-        # V8 path: refresh the LayersTabWidget cards in place
-        if self._layers_tab_widget is not None:
-            self._rebuild_layers_tab()
+        if not hasattr(self, "spot_fixture") and self._layers_tab_widget is not None:
+            # V8 mode: legacy combos never created — refresh the layers widget instead
+            try:
+                self._layers_tab_widget.refresh_fixture_options(catalogue_keys)
+            except Exception:
+                pass
         self.energy_rate.setValue(self.room.electricity_rate)
         if hasattr(self, "heatmap_opacity"):
             self.heatmap_opacity.setValue(self.room.heatmap_opacity)
@@ -9209,8 +9183,8 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
             self.labour_rate_in.setValue(self.room.labour_rate)
             self.labour_hours_in.setValue(self.room.labour_hours)
             self.markup_in.setValue(self.room.material_markup_pct)
-        self._rebuild_layers_tab()
-        # recalculate() is invoked by the _refresh_all_controls() wrapper.
+
+
 
     # ── V8: Natural Language ──────────────────────────────────────────────
     def _apply_nl_parsed(self, parsed: dict) -> None:
@@ -9219,7 +9193,7 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
         if parsed.get("width"):  self.room.width  = float(parsed["width"])
         if parsed.get("length"): self.room.length = float(parsed["length"])
         if parsed.get("ceiling"):self.room.ceiling_height = float(parsed["ceiling"])
-        if parsed.get("cct"):    self.room.cct_preset = cct_preset_for_kelvin(parsed["cct"])
+        if parsed.get("cct"):    self.room.cct_preset = cct_preset_for_kelvin(int(parsed["cct"]))
         if parsed.get("lux"):
             self.room.lux_override = int(parsed["lux"])
             self.room.target_unit = "lux"
@@ -9240,10 +9214,7 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
     def _apply_design_package(self, name: str, cfg: dict) -> None:
         # CCT
         cct = cfg.get("cct", 3000)
-        if isinstance(cct, str):
-            self.room.cct_preset = cct if cct in CCT_PRESETS else cct_preset_for_kelvin(3000)
-        else:
-            self.room.cct_preset = cct_preset_for_kelvin(cct)
+        self.room.cct_preset = cct_preset_for_kelvin(cct)
         # feeling
         feel = cfg.get("feel","")
         if feel: self.room.client_brief.desired_feeling = feel
@@ -9260,58 +9231,18 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
 
     # ── V8: View toggle ───────────────────────────────────────────────────
 
-    def _schedule_undo_push(self) -> None:
-        """Coalesce rapid changes (e.g. spinbox drags) into a single undo entry."""
-        if not hasattr(self, "_undo_push_timer"):
-            self._undo_push_timer = QTimer(self)
-            self._undo_push_timer.setSingleShot(True)
-            self._undo_push_timer.timeout.connect(self._commit_undo_push)
-        self._undo_push_timer.start(600)
-
-    def _commit_undo_push(self) -> None:
-        if self._suppress_undo_push:
-            return
-        try:
-            self.undo_stack.push(self.room.to_dict())
-        except Exception as exc:
-            self.state.report_error(f"Undo push failed: {exc}")
-
-    def _restore_room_state(self, room_dict: dict) -> None:
-        """Rebuild the model from a snapshot without polluting the undo history."""
-        if hasattr(self, "_undo_push_timer"):
-            self._undo_push_timer.stop()
-        self._suppress_undo_push = True
-        try:
-            self.room = RoomModel.from_dict(room_dict)
-            ModelGuard.sanitize_room(self.room)
-            self._refresh_all_controls()
-        finally:
-            self._suppress_undo_push = False
-
-    def _snapshot_room_dict(self) -> dict:
-        """Room dict for a saved snapshot, without the (recursive) notes/snapshots."""
-        d = self.room.to_dict()
-        d.pop("sticky_notes", None)
-        d.pop("project_snapshots", None)
-        return d
-
-    def _sync_annotations_to_room(self) -> None:
-        """Pull sticky notes & saved snapshots from the side panels into the model."""
-        if hasattr(self, "_sticky_notes"):
-            self.room.sticky_notes = self._sticky_notes.get_notes()
-        if hasattr(self, "_snapshots"):
-            self.room.project_snapshots = self._snapshots.get_snaps()
-
-    def _sync_annotations_from_room(self) -> None:
-        """Push sticky notes & saved snapshots from the model into the side panels."""
-        if hasattr(self, "_sticky_notes"):
-            self._sticky_notes.set_notes(self.room.sticky_notes)
-        if hasattr(self, "_snapshots"):
-            self._snapshots.set_snaps(self.room.project_snapshots)
-
     def _restore_snapshot(self, room_dict: dict) -> None:
         try:
-            self._restore_room_state(room_dict)
+            self._suppress_undo_push = True
+            try:
+                self.room = RoomModel.from_dict(room_dict)
+                ModelGuard.sanitize_room(self.room)
+                self._refresh_all_controls()
+                self.recalculate()
+            finally:
+                self._suppress_undo_push = False
+            # capture the restored state as one explicit undo entry
+            self.undo_stack.push(self.room.to_dict())
             self.status.showMessage("✅ גרסה שוחזרה")
         except Exception as e:
             QMessageBox.warning(self, "שגיאה", f"שחזור נכשל: {e}")
@@ -9346,33 +9277,46 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
     def _undo(self) -> None:
         state = self.undo_stack.undo()
         if state:
-            self._restore_room_state(state)
-            self.status.showMessage("↩ בוטל")
+            self._suppress_undo_push = True
+            try:
+                self.room = RoomModel.from_dict(state)
+                ModelGuard.sanitize_room(self.room)
+                self._refresh_all_controls()
+            finally:
+                self._suppress_undo_push = False
+            self.status.showMessage("↩ ביטול")
 
     def _redo(self) -> None:
         state = self.undo_stack.redo()
         if state:
-            self._restore_room_state(state)
-            self.status.showMessage("↪ בוצע שוב")
+            self._suppress_undo_push = True
+            try:
+                self.room = RoomModel.from_dict(state)
+                ModelGuard.sanitize_room(self.room)
+                self._refresh_all_controls()
+            finally:
+                self._suppress_undo_push = False
+            self.status.showMessage("↪ ביצוע מחדש")
 
     def closeEvent(self, event) -> None:
-        if not getattr(self.state, "dirty", False):
+        if not getattr(self, "state", None) or not self.state.dirty:
             event.accept()
             return
-        reply = QMessageBox.question(
-            self, "שינויים לא נשמרו",
-            "יש שינויים שלא נשמרו. לשמור לפני יציאה?",
+        choice = QMessageBox.question(
+            self,
+            "שינויים שלא נשמרו",
+            "יש שינויים שלא נשמרו בפרויקט.\nלשמור לפני היציאה?",
             QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
             QMessageBox.Save,
         )
-        if reply == QMessageBox.Save:
+        if choice == QMessageBox.Save:
             self.save_project()
-            # If still dirty (save cancelled/failed), abort the close.
-            if getattr(self.state, "dirty", False):
+            if self.state.dirty:
+                # Save was cancelled or failed — keep the window open.
                 event.ignore()
             else:
                 event.accept()
-        elif reply == QMessageBox.Discard:
+        elif choice == QMessageBox.Discard:
             event.accept()
         else:
             event.ignore()
@@ -9463,7 +9407,7 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
             extracted: Dict[str, str] = {}
             if ProjectContainer.is_zip(path):
                 room_dict, assets = ProjectContainer.load(path)
-                # restore bundled assets to temp dir
+                # restore bundled assets to temp dir and remember their new paths
                 if assets:
                     cache = os.path.join(tempfile.gettempdir(), "ldp_assets")
                     os.makedirs(cache, exist_ok=True)
@@ -9475,27 +9419,28 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
             else:
                 with open(path, "r", encoding="utf-8") as f:
                     room_dict = json.load(f)
-                assets = {}
-            # Repoint asset references (saved as relative "assets/<basename>") to the
-            # freshly extracted temp files, matching by basename.
-            def _resolve_asset(value: str) -> str:
-                base = os.path.basename(value) if value else ""
-                return extracted.get(base, value)
-            fp = room_dict.get("floor_plan")
-            if isinstance(fp, dict) and fp.get("path"):
-                fp["path"] = _resolve_asset(fp["path"])
-            br = room_dict.get("branding")
-            if isinstance(br, dict) and br.get("company_logo"):
-                br["company_logo"] = _resolve_asset(br["company_logo"])
             self.room = RoomModel.from_dict(room_dict)
             ModelGuard.sanitize_room(self.room)
+            # Re-point underlay + logo to the extracted asset paths (match by
+            # basename) so they survive a round-trip opened on another machine.
+            if extracted:
+                fp = self.room.floor_plan.path
+                if fp and os.path.basename(fp) in extracted:
+                    self.room.floor_plan.path = extracted[os.path.basename(fp)]
+                logo = self.room.branding.company_logo
+                if logo and os.path.basename(logo) in extracted:
+                    self.room.branding.company_logo = extracted[os.path.basename(logo)]
             self.current_file = path
             self._suppress_undo_push = True
             try:
                 self._refresh_all_controls()
-                self._sync_annotations_from_room()
             finally:
                 self._suppress_undo_push = False
+            # Restore persisted sticky notes and version snapshots
+            if hasattr(self, "_sticky_notes"):
+                self._sticky_notes.set_notes(self.room.sticky_notes)
+            if hasattr(self, "_snapshots"):
+                self._snapshots.set_snapshots(self.room.snapshots)
             self.state.mark_saved()
             self.undo_stack.clear()
             self.undo_stack.push(self.room.to_dict())
@@ -9520,7 +9465,11 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
     def _save_to(self, path: str) -> None:
         try:
             self._read_inputs()
-            self._sync_annotations_to_room()
+            # Sync sticky notes + version snapshots into the model so they persist.
+            if hasattr(self, "_sticky_notes"):
+                self.room.sticky_notes = self._sticky_notes.get_notes()
+            if hasattr(self, "_snapshots"):
+                self.room.snapshots = self._snapshots.get_snapshots()
             # Collect asset paths (underlay + logo)
             assets = []
             if self.room.floor_plan.path and os.path.isfile(self.room.floor_plan.path):
@@ -9548,112 +9497,80 @@ h3{{color:{P['cyan']};margin-bottom:4px}}
                 with open(path, "r", encoding="utf-8-sig", newline="") as f:
                     rows = [(r.get("name") or r.get("שם") or f"fixture_{i}", r) for i, r in enumerate(csv.DictReader(f))]
             for name, raw in rows:
-                self.room.fixture_catalogue[str(name)] = self._normalize_imported_fixture(raw)
+                entry = {
+                    "lm": float(raw.get("lm", raw.get("lumens", 800))),
+                    "w": float(raw.get("w", raw.get("watts", 8))),
+                    "cri": float(raw.get("cri", 90)),
+                    "beam": float(raw.get("beam", raw.get("beam_angle", 36))),
+                    "cct": int(float(raw.get("cct", 3000))),
+                    "brand": raw.get("brand", raw.get("מותג", "")),
+                    "price": float(raw.get("price", raw.get("מחיר", 0))),
+                    "datasheet": raw.get("datasheet", ""),
+                    "favorite": str(raw.get("favorite", raw.get("מועדף", ""))).lower() in {"1", "true", "yes", "y"},
+                }
+                # optional commercial-schema fields (kept if present)
+                for key in ("category", "sku", "mounting", "ip", "dimming",
+                            "photometry_file", "currency"):
+                    if raw.get(key) not in (None, ""):
+                        entry[key] = raw[key]
+                for key in ("cct_default", "ugr_rated", "lifetime_l70_hours", "sdcm"):
+                    if raw.get(key) not in (None, ""):
+                        try:
+                            entry[key] = int(float(raw[key]))
+                        except (TypeError, ValueError):
+                            pass
+                for key in ("length_m", "lm_per_m"):
+                    if raw.get(key) not in (None, ""):
+                        try:
+                            entry[key] = float(raw[key])
+                        except (TypeError, ValueError):
+                            pass
+                # list-valued fields can arrive as JSON lists or "a;b;c" strings
+                for key in ("track_widths", "beam_variants", "cct_options"):
+                    val = raw.get(key)
+                    if isinstance(val, list):
+                        entry[key] = [float(x) for x in val]
+                    elif isinstance(val, str) and val.strip():
+                        try:
+                            entry[key] = [float(x) for x in val.replace(",", ";").split(";") if x.strip()]
+                        except ValueError:
+                            pass
+                self.room.fixture_catalogue[str(name)] = normalize_fixture(entry)
             self._refresh_all_controls()
             QMessageBox.information(self, "הצלחה", "קטלוג הגופים נטען.")
         except Exception as exc:
             QMessageBox.critical(self, "שגיאה", f"ייבוא קטלוג נכשל:\n{exc}")
 
-    @staticmethod
-    def _normalize_imported_fixture(raw: dict) -> dict:
-        """Map an imported row (JSON/CSV, old or new schema) to a fixture dict."""
-        def _f(*keys, default=0.0):
-            for k in keys:
-                if k in raw and raw[k] not in (None, ""):
-                    try:
-                        return float(raw[k])
-                    except (TypeError, ValueError):
-                        pass
-            return default
-
-        def _parse_list(val):
-            if isinstance(val, list):
-                return [float(x) for x in val]
-            if isinstance(val, str) and val.strip():
-                out = []
-                for tok in val.replace(";", ",").replace("|", ",").split(","):
-                    tok = tok.strip()
-                    if tok:
-                        try:
-                            out.append(float(tok))
-                        except ValueError:
-                            pass
-                return out
-            return []
-
-        lm = _f("lm", "lumens", default=800)
-        w = _f("w", "watts", default=8) or 8
-        fx = {
-            "lm": lm,
-            "w": w,
-            "cri": _f("cri", default=90),
-            "beam": _f("beam", "beam_angle", default=36),
-            "cct": int(_f("cct", default=3000)),
-            "brand": raw.get("brand", raw.get("מותג", "")),
-            "price": _f("price", "מחיר", default=0),
-            "currency": raw.get("currency", "ILS"),
-            "efficacy": round(lm / max(w, 0.1), 1),
-        }
-        # Optional normalized / metadata fields (only stored when present).
-        for key in ("category", "sku", "mounting", "ip", "dimming", "datasheet",
-                    "photometry_file"):
-            if raw.get(key):
-                fx[key] = raw[key]
-        for key in ("cct_default",):
-            if raw.get(key):
-                fx[key] = int(_f(key, default=fx["cct"]))
-        for key in ("sdcm", "lifetime", "ugr_rated"):
-            if raw.get(key) not in (None, ""):
-                fx[key] = _f(key)
-        for key in ("length_m", "lm_per_m"):
-            if raw.get(key) not in (None, ""):
-                fx[key] = _f(key)
-        cct_options = _parse_list(raw.get("cct_options"))
-        if cct_options:
-            fx["cct_options"] = [int(x) for x in cct_options]
-        beam_variants = _parse_list(raw.get("beam_variants"))
-        if beam_variants:
-            fx["beam_variants"] = beam_variants
-        track_widths = _parse_list(raw.get("track_widths"))
-        if track_widths:
-            fx["track_widths"] = track_widths
-        fav = str(raw.get("favorite", raw.get("מועדף", ""))).lower()
-        if fav in {"1", "true", "yes", "y"}:
-            fx["favorite"] = True
-        return fx
-
     def export_catalogue(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "ייצא קטלוג", "fixture_catalogue.json",
-            "JSON (*.json);;CSV (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(self, "ייצא קטלוג", "fixtures.json", "JSON (*.json);;CSV (*.csv)")
         if not path:
             return
-        if not os.path.splitext(path)[1]:
-            path += ".json"
         try:
-            cat = self.room.fixture_catalogue
+            if not os.path.splitext(path)[1]:
+                path += ".json"
+            catalogue = self.room.fixture_catalogue
             if path.lower().endswith(".csv"):
-                # Union of all keys so the CSV is complete and round-trippable.
-                fields = ["name"]
-                seen = set(fields)
-                for data in cat.values():
-                    for k in data:
-                        if k not in seen:
-                            seen.add(k)
-                            fields.append(k)
+                # union of all keys across entries for a stable header
+                columns = ["name", "lm", "w", "efficacy", "cri", "beam", "cct",
+                           "brand", "price", "currency", "category", "sku",
+                           "mounting", "ip", "dimming", "cct_default", "cct_options",
+                           "beam_variants", "track_widths", "length_m", "lm_per_m",
+                           "ugr_rated", "sdcm", "lifetime_l70_hours",
+                           "photometry_file", "datasheet"]
+                extra = sorted({k for d in catalogue.values() for k in d} - set(columns))
+                columns += extra
                 with open(path, "w", encoding="utf-8-sig", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=fields)
+                    writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
                     writer.writeheader()
-                    for name, data in cat.items():
+                    for name, data in catalogue.items():
                         row = {"name": name}
                         for k, v in data.items():
-                            row[k] = ",".join(str(x) for x in v) if isinstance(v, list) else v
+                            row[k] = ";".join(str(x) for x in v) if isinstance(v, list) else v
                         writer.writerow(row)
             else:
                 with open(path, "w", encoding="utf-8") as f:
-                    json.dump(cat, f, ensure_ascii=False, indent=2)
-            self.status.showMessage(f"קטלוג יוצא: {path}")
-            QMessageBox.information(self, "הצלחה", f"קטלוג הגופים יוצא:\n{path}")
+                    json.dump(catalogue, f, ensure_ascii=False, indent=2)
+            QMessageBox.information(self, "הצלחה", f"הקטלוג יוצא:\n{path}")
         except Exception as exc:
             QMessageBox.critical(self, "שגיאה", f"ייצוא קטלוג נכשל:\n{exc}")
 
@@ -9748,6 +9665,8 @@ def main() -> None:
     splash = (PremiumSplash if _V8_TEAM_LOADED else PremiumStartupSplash)()
     splash.show()
     win = LightingApp()
+    if _V8_TEAM_LOADED:
+        patch_lightingapp_bugs(type(win))
     win.setWindowOpacity(0.0)
     win.show()
     QTimer.singleShot(1100, splash.close)
